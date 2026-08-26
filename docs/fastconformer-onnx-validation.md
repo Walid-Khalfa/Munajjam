@@ -131,7 +131,8 @@ export MUNAJJAM_FASTCONFORMER_VOCAB_PATH=/path/to/vocabulary.txt
 ### Expected Colab setup
 
 ```python
-# 1. Install the API extras (huggingface_hub is included in the runtime deps)
+# 1. Install the API extras (huggingface_hub and onnxruntime are included
+#    in the runtime deps)
 !pip install -e ./munajjam[api]
 
 # 2. (Optional) export the model once — heavy, CPU-only NeMo:
