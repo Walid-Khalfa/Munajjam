@@ -6,6 +6,7 @@ from munajjam.transcription.ctc_segmentation import (
     FastConformerCTCTranscriber,
     SileroVADChunker,
 )
+from munajjam.transcription.fastconformer_models import resolve_fastconformer_assets
 from munajjam.transcription.whisper import WhisperTranscriber
 from munajjam.transcription.whisperx import Whisperx
 
@@ -34,15 +35,17 @@ class WhisperFactory:
         elif backend == WhisperBackend.WHISPERX:
             return Whisperx(model_name=model_name, device=device, compute_type=compute_type)
         elif backend == WhisperBackend.CTC_SEGMENTATION:
-            # The transcriber is lazy: no model is loaded here, so creating it
-            # is cheap. The ONNX graph, vocab and tokenizer are resolved from
-            # settings on first transcribe() call.
+            # Provision the ONNX graph + tokenizer up front (explicit env
+            # paths win, then the cache, then a configured HF repo; a missing
+            # source raises ConfigurationError). The transcriber itself stays
+            # lazy: no ONNX session / tokenizer is loaded here.
             settings = get_settings()
+            assets = resolve_fastconformer_assets(settings)
             chunker = SileroVADChunker() if settings.fastconformer_vad_enabled else None
             return FastConformerCTCTranscriber(
-                model_path=settings.fastconformer_model_path,
-                vocab_path=settings.fastconformer_vocab_path,
-                tokenizer_model_path=settings.fastconformer_tokenizer_model_path,
+                model_path=assets.model_path,
+                vocab_path=assets.vocab_path,
+                tokenizer_model_path=assets.tokenizer_model_path,
                 chunker=chunker,
                 blank_transition_cost_zero=settings.fastconformer_blank_transition_cost_zero,
             )

@@ -1,15 +1,17 @@
 import gc
 import os
 import shutil
+import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import cast
+from typing import Annotated, cast
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from munajjam.config import get_settings
+from munajjam.exceptions import ConfigurationError, MunajjamError
 from munajjam.models import Segment
 from munajjam.transcription.ctc_segmentation import FastConformerCTCTranscriber
 from munajjam.transcription.whisperFactory import WhisperBackend, WhisperFactory
@@ -54,27 +56,28 @@ global_transcriber = WhisperFactory().create_whisper(backend=WhisperBackend.WHIS
 
 # The CTC transcriber is also created lazily — no ONNX/tokenizer is loaded here.
 _ctc_transcriber: FastConformerCTCTranscriber | None = None
+# Guards lazy creation so concurrent first requests never double-provision
+# (double download / double initialization) the FastConformer assets.
+_ctc_lock = threading.Lock()
 
 
 def _get_ctc_transcriber() -> FastConformerCTCTranscriber:
-    """Lazy singleton for the FastConformer CTC segmentation backend."""
+    """
+    Lazy singleton for the FastConformer CTC segmentation backend.
+
+    Model asset provisioning (explicit env paths -> cache -> configured HF
+    repo) happens inside :meth:`WhisperFactory.create_whisper`; when no source
+    is available it raises :class:`~munajjam.exceptions.ConfigurationError`,
+    which callers map to a structured JSON error.
+    """
     global _ctc_transcriber
     if _ctc_transcriber is None:
-        settings = get_settings()
-        if not settings.fastconformer_model_path:
-            raise ValueError(
-                "MUNAJJAM_FASTCONFORMER_MODEL_PATH is not set. "
-                "Provide the path to the exported ONNX graph."
-            )
-        if not settings.fastconformer_tokenizer_model_path:
-            raise ValueError(
-                "MUNAJJAM_FASTCONFORMER_TOKENIZER_MODEL_PATH is not set. "
-                "Provide the path to the SentencePiece tokenizer.model."
-            )
-        _ctc_transcriber = cast(
-            FastConformerCTCTranscriber,
-            WhisperFactory().create_whisper(backend=WhisperBackend.CTC_SEGMENTATION),
-        )
+        with _ctc_lock:
+            if _ctc_transcriber is None:
+                _ctc_transcriber = cast(
+                    FastConformerCTCTranscriber,
+                    WhisperFactory().create_whisper(backend=WhisperBackend.CTC_SEGMENTATION),
+                )
     return _ctc_transcriber
 
 
@@ -114,7 +117,7 @@ def _run_job(
         jobs[job_id] = {"status": "success", "data": response_data, "error": None}
         print(f"[Job {job_id[:8]}] Completed successfully")
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - job worker must catch every failure
         traceback.print_exc()
         jobs[job_id] = {"status": "error", "data": None, "error": str(e)}
         print(f"[Job {job_id[:8]}] Error: {e!s}")
@@ -144,17 +147,48 @@ def _run_ctc_job(
         jobs[job_id] = {"status": "success", "data": response_data, "error": None}
         print(f"[Job {job_id[:8]}] Completed CTC segmentation successfully")
 
-    except Exception as e:
-        import traceback
-
+    except MunajjamError as e:
+        # Expected domain errors (configuration, provisioning, alignment).
+        # Surface only the safe message; keep full context in the logs.
         traceback.print_exc()
-        jobs[job_id] = {"status": "error", "data": None, "error": str(e)}
-        print(f"[Job {job_id[:8]}] CTC segmentation error: {e!s}")
+        jobs[job_id] = {
+            "status": "error",
+            "data": None,
+            "error": e.message,
+            "status_code": _ctc_error_status_code(e),
+        }
+        print(f"[Job {job_id[:8]}] CTC segmentation error: {e}")
+
+    except Exception as e:  # noqa: BLE001 - job worker must catch every failure
+        # Unexpected internal failure: log the full traceback server-side, but
+        # never leak stack traces or internals to the client.
+        traceback.print_exc()
+        jobs[job_id] = {
+            "status": "error",
+            "data": None,
+            "error": "Internal server error while running CTC segmentation.",
+            "status_code": 500,
+        }
+        print(f"[Job {job_id[:8]}] Unexpected CTC segmentation error: {e!s}")
 
     finally:
         if os.path.exists(file_location):
             os.remove(file_location)
         gc.collect()
+
+
+def _ctc_error_status_code(error: MunajjamError) -> int:
+    """
+    Map expected CTC domain errors to HTTP status codes.
+
+    Configuration/provisioning failures (missing or invalid model assets) are
+    reported as 422 Unprocessable Entity so they don't look like internal
+    crashes; other domain errors (e.g. alignment failures) keep the existing
+    500 convention.
+    """
+    if isinstance(error, ConfigurationError):
+        return 422
+    return 500
 
 
 def _build_response(segments: list[Segment]) -> list[dict[str, object]]:
@@ -179,7 +213,7 @@ def _build_response(segments: list[Segment]) -> list[dict[str, object]]:
 async def align_audio(
     surah_number: int,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: Annotated[UploadFile, File()],
     riwaya: str = Form("hafs"),
     model_size: str | None = Form(None),
     alignment_mode: str = Form("whisperx"),
@@ -233,7 +267,7 @@ async def align_audio(
     os.makedirs("temp_audio", exist_ok=True)
     file_location = os.path.join("temp_audio", f"{job_id}_{surah_number}.mp3")
 
-    with open(file_location, "wb") as buffer:
+    with open(file_location, "wb") as buffer:  # noqa: ASYNC230 - upload write stays sync
         shutil.copyfileobj(file.file, buffer)
 
     jobs[job_id] = {"status": "queued", "data": None, "error": None}
@@ -278,8 +312,11 @@ async def get_job_status(job_id: str) -> JSONResponse:
     if job["status"] == "success":
         return JSONResponse({"status": "success", "data": job["data"]})
     elif job["status"] == "error":
+        # Expected domain errors carry a specific status_code (e.g. 422 for
+        # missing model configuration); everything else keeps the 500 default.
         return JSONResponse(
-            {"status": "error", "message": job["error"]}, status_code=500
+            {"status": "error", "message": job["error"]},
+            status_code=int(job.get("status_code", 500)),
         )
     else:
         return JSONResponse(

@@ -29,7 +29,7 @@ model.export(...)                                    # exports the CTC head
 
 Without this step the exported graph would contain the RNNT decoder instead.
 
-## Export procedure
+## Export procedure (``scripts/export_fastconformer_onnx.py``)
 
 ```bash
 # 1. Validation-only environment (not a munajjam runtime dependency)
@@ -41,23 +41,111 @@ mkdir -p .model_validation
 wget -O .model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo \
   "https://huggingface.co/nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0/resolve/main/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo"
 
-# 3. Export both graphs
+# 3. Export both graphs + extract the tokenizer
 python scripts/export_fastconformer_onnx.py \
   .model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo \
-  .model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0
+  --output-dir .model_validation/fastconformer
 ```
 
-This produces:
+This produces (for ``stem = stt_ar_fastconformer_hybrid_large_pc_v1.0``):
 
 | File | Input | Output | Notes |
 |---|---|---|---|
-| `..._ctc.onnx` (458 MB) | `audio_signal` f32 `[B, 80, T_mel]` (log-mel), `length` i64 `[B]` | `logprobs` f32 `[B, T', 1025]` | NeMo's *stock* export; the preprocessor is **not** in the graph |
-| `..._ctc_rawaudio.onnx` (3 MB graph + `.onnx.data` weights) | `input_signal` f32 `[B, T]` (raw 16 kHz waveform), `input_signal_length` i32 `[B]` | `logprobs` f32 `[B, T', 1025]`, `encoded_lengths` i64 `[B]` | Munajjam *production* export; preprocessor + encoder + CTC head in one graph |
+| `{stem}_ctc.onnx` (458 MB) | `audio_signal` f32 `[B, 80, T_mel]` (log-mel), `length` i64 `[B]` | `logprobs` f32 `[B, T', 1025]` | NeMo's *stock* export; the preprocessor is **not** in the graph |
+| `{stem}_ctc_rawaudio.onnx` (3 MB graph + `.onnx.data` weights) | `input_signal` f32 `[B, T]` (raw 16 kHz waveform), `input_signal_length` i32 `[B]` | `logprobs` f32 `[B, T', 1025]`, `encoded_lengths` i64 `[B]` | Munajjam *production* export; preprocessor + encoder + CTC head in one graph |
+| `tokenizer.model` | — | — | SentencePiece model extracted from the `.nemo` (deterministically, from `model_config.yaml`'s `tokenizer.model`) |
+| `vocabulary.txt` | — | — | Labels dump extracted from the archive when present (optional) |
 
 The production (raw-audio) export is implemented by tracing a wrapper module
 (`preprocessor → encoder → ctc_decoder`) with `torch.onnx.export`, so the
 audio front-end is bit-identical to NeMo's training-time preprocessing (no
 numpy reimplementation of STFT/mel/log/per-feature normalization needed).
+The graph uses dynamic axes on the time dimension (any audio length) and the
+script runs a post-export onnxruntime sanity check by default (`--no-validate`
+to skip). Existing outputs are never overwritten unless `--force` is passed.
+
+The stock export is optional for the Munajjam runtime — only
+`{stem}_ctc_rawaudio.onnx` + `tokenizer.model` are consumed.
+
+## Model provisioning (server / API)
+
+The server never requires manual environment variables for a first run.
+Assets are resolved in one place
+(`munajjam/transcription/fastconformer_models.py`, used by
+`WhisperFactory` when `alignment_mode=ctc_segmentation`):
+
+### Flow A — automatic / cached provisioning
+
+1. **Explicit env vars win** — if `MUNAJJAM_FASTCONFORMER_MODEL_PATH` and
+   `MUNAJJAM_FASTCONFORMER_TOKENIZER_MODEL_PATH` are set, they are validated
+   and used as-is (optional `MUNAJJAM_FASTCONFORMER_VOCAB_PATH`). A
+   half-configured or invalid setup fails fast with a clear error.
+2. **Provisioning cache** — otherwise the deterministic cache directory is
+   checked: `MUNAJJAM_FASTCONFORMER_CACHE_DIR`, or
+   `~/.cache/munajjam/fastconformer` by default. Expected canonical filenames:
+
+   ```text
+   stt_ar_fastconformer_hybrid_large_pc_v1.0_ctc_rawaudio.onnx
+   tokenizer.model
+   vocabulary.txt   (optional)
+   ```
+
+   Cached assets are reused as-is — no re-download.
+3. **Hugging Face (opt-in)** — if `MUNAJJAM_FASTCONFORMER_HF_REPO_ID` is set
+   to a repo that really hosts the pre-exported files (same canonical
+   filenames as above), they are downloaded into the cache via
+   `huggingface_hub` (concurrency-safe, cache-aware) and pinned to
+   `MUNAJJAM_FASTCONFORMER_HF_REVISION` when configured.
+
+   > No such public repo is assumed by default — the resolver does **not**
+   > invent URLs. Until real hosted assets exist, step 3 is a no-op unless an
+   > operator configures a repo that actually contains the files.
+4. **Actionable error** — if none of the above yields assets, the API returns
+   a structured JSON error (HTTP 422) explaining how to make them available:
+   set the two env vars, or run the export script.
+
+First-use resolution is concurrency-safe (a lock prevents double downloads /
+parallel initialization), matching the lazy model-loading developer experience
+of WhisperX / Wav2Vec2.
+
+### Flow B — manual export
+
+```bash
+python scripts/export_fastconformer_onnx.py \
+  .model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo \
+  --output-dir ~/.cache/munajjam/fastconformer
+```
+
+Because the export writes exactly the canonical filenames the resolver looks
+for, exporting straight into the cache directory makes the server pick the
+assets up automatically on the next request. Alternatively export anywhere
+and set:
+
+```bash
+export MUNAJJAM_FASTCONFORMER_MODEL_PATH=/path/to/stt_ar_fastconformer_hybrid_large_pc_v1.0_ctc_rawaudio.onnx
+export MUNAJJAM_FASTCONFORMER_TOKENIZER_MODEL_PATH=/path/to/tokenizer.model
+# optional:
+export MUNAJJAM_FASTCONFORMER_VOCAB_PATH=/path/to/vocabulary.txt
+```
+
+### Expected Colab setup
+
+```python
+# 1. Install the API extras (huggingface_hub is included in the runtime deps)
+!pip install -e ./munajjam[api]
+
+# 2. (Optional) export the model once — heavy, CPU-only NeMo:
+#    !pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#    !pip install "nemo_toolkit[asr]" onnx onnxscript onnxruntime
+#    !wget -O stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo \
+#      https://huggingface.co/nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0/resolve/main/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo
+#    !python scripts/export_fastconformer_onnx.py stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo \
+#      --output-dir /root/.cache/munajjam/fastconformer
+
+# 3. Start the server and POST /align/{surah_number} with
+#    alignment_mode=ctc_segmentation. Nothing else is required when the
+#    assets are cached or explicit paths are exported.
+```
 
 ## Verified ONNX contract (production graph)
 
@@ -107,18 +195,17 @@ The residual is float32 kernel-level noise between torch CPU and ONNX Runtime
 CPU (accumulated through 17 encoder layers), not a systematic error. The
 export is numerically faithful.
 
-## Validation script
+## Validation
 
-```bash
-python scripts/validate_fastconformer_onnx.py \
-  .model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0_ctc_rawaudio.onnx \
-  <16kHz_mono_wav> \
-  [.model_validation/stt_ar_fastconformer_hybrid_large_pc_v1.0.nemo]   # optional NeMo parity
-```
+The export script runs a post-export sanity check by default (disable with
+`--no-validate`): it loads `{stem}_ctc_rawaudio.onnx` with onnxruntime,
+verifies the I/O contract (float32 waveform + int32 length inputs, `logprobs`
+and `encoded_lengths` outputs) and executes a short dummy inference.
 
-It prints the graph contract, runs a real inference (shape/dtype/
-log-softmax/blank behavior/frame mapping), optionally compares against NeMo,
-and runs `FastConformerInference.log_probs()` end-to-end.
+The standalone `scripts/validate_fastconformer_onnx.py` used during the
+original validation session was a local throwaway; its checks (shape/dtype,
+log-softmax normalization, blank dominance, frame mapping) were folded into
+this built-in validation and into `FastConformerInference` itself.
 
 ## Result
 

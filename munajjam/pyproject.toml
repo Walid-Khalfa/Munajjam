@@ -47,6 +47,11 @@ dependencies = [
     "soundfile>=0.12.0",
     "sentencepiece>=0.1.96",
     "ctc-segmentation>=1.7.4",
+    # Model provisioning for the FastConformer CTC backend: concurrency-safe,
+    # cache-aware downloads from Hugging Face (same dev experience as
+    # WhisperX/Wav2Vec2). Small pure-Python; only exercised when
+    # MUNAJJAM_FASTCONFORMER_HF_REPO_ID is configured.
+    "huggingface_hub>=0.23.0",
 ]
 
 [project.optional-dependencies]

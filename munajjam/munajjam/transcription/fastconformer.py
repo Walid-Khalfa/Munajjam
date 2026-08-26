@@ -16,8 +16,8 @@ ONNX model contract
 -------------------
 All values below were verified empirically against a real export of
 ``nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0`` (see
-``scripts/export_fastconformer_onnx.py`` and
-``scripts/validate_fastconformer_onnx.py``).
+``scripts/export_fastconformer_onnx.py``, whose built-in ``--validate`` runs
+the contract check).
 
 The checkpoint is a NeMo ``EncDecHybridRNNTCTCBPEModel`` (hybrid RNNT/CTC).
 The ONNX graph must expose the **CTC head**, i.e. it must be exported after

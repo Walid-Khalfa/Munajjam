@@ -1,13 +1,15 @@
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from munajjam.exceptions import TranscriptionError
+from munajjam.exceptions import ConfigurationError, TranscriptionError
 from munajjam.models import SegmentType
 from munajjam.transcription.ctc_segmentation import (
     FastConformerCTCTranscriber,
     SileroVADChunker,
 )
+from munajjam.transcription.fastconformer_models import FastConformerAssets
 from munajjam.transcription.whisper import WhisperTranscriber
 from munajjam.transcription.whisperFactory import WhisperBackend, WhisperFactory
 from munajjam.transcription.whisperx import Whisperx
@@ -58,19 +60,28 @@ def test_whisper_factory_whisperx(factory):
 @patch("munajjam.transcription.whisperFactory.FastConformerCTCTranscriber")
 def test_whisper_factory_ctc_segmentation(mock_cls, factory):
     mock_cls.return_value = MagicMock()
-    with patch("munajjam.transcription.whisperFactory.get_settings") as mock_settings:
+    assets = FastConformerAssets(
+        model_path=Path("/models/ctc.onnx"),
+        tokenizer_model_path=Path("/models/tokenizer.model"),
+        vocab_path=Path("/models/vocab.txt"),
+    )
+    with (
+        patch(
+            "munajjam.transcription.whisperFactory.resolve_fastconformer_assets",
+            return_value=assets,
+        ) as mock_resolve,
+        patch("munajjam.transcription.whisperFactory.get_settings") as mock_settings,
+    ):
         s = mock_settings.return_value
-        s.fastconformer_model_path = "/models/ctc.onnx"
-        s.fastconformer_vocab_path = "/models/vocab.txt"
-        s.fastconformer_tokenizer_model_path = "/models/tokenizer.model"
         s.fastconformer_vad_enabled = False
         s.fastconformer_blank_transition_cost_zero = False
         transcriber = factory.create_whisper(WhisperBackend.CTC_SEGMENTATION)
         assert transcriber is mock_cls.return_value
+        mock_resolve.assert_called_once()
         mock_cls.assert_called_once_with(
-            model_path="/models/ctc.onnx",
-            vocab_path="/models/vocab.txt",
-            tokenizer_model_path="/models/tokenizer.model",
+            model_path=Path("/models/ctc.onnx"),
+            vocab_path=Path("/models/vocab.txt"),
+            tokenizer_model_path=Path("/models/tokenizer.model"),
             chunker=None,
             blank_transition_cost_zero=False,
         )
@@ -79,7 +90,17 @@ def test_whisper_factory_ctc_segmentation(mock_cls, factory):
 @patch("munajjam.transcription.whisperFactory.FastConformerCTCTranscriber")
 def test_whisper_factory_ctc_segmentation_vad_enabled(mock_cls, factory):
     mock_cls.return_value = MagicMock()
-    with patch("munajjam.transcription.whisperFactory.get_settings") as mock_settings:
+    assets = FastConformerAssets(
+        model_path=Path("/models/ctc.onnx"),
+        tokenizer_model_path=Path("/models/tokenizer.model"),
+    )
+    with (
+        patch(
+            "munajjam.transcription.whisperFactory.resolve_fastconformer_assets",
+            return_value=assets,
+        ),
+        patch("munajjam.transcription.whisperFactory.get_settings") as mock_settings,
+    ):
         mock_settings.return_value.fastconformer_vad_enabled = True
         factory.create_whisper(WhisperBackend.CTC_SEGMENTATION)
         _, kwargs = mock_cls.call_args
@@ -168,13 +189,15 @@ def test_whisper_transcriber_transcribe_transformers(
     transcriber._model = mock_model
 
     # Mock librosa get_duration
-    with patch("munajjam.transcription.whisper.librosa.get_duration", return_value=1.5):
+    with (
+        patch("munajjam.transcription.whisper.librosa.get_duration", return_value=1.5),
         # Mock Arabic text detection assuming an ayah mapping function could be invoked
-        with patch(
+        patch(
             "munajjam.transcription.whisper.detect_segment_type",
             return_value=(SegmentType.AYAH, 1),
-        ):
-            segments = transcriber.transcribe("1.wav", surah_id=1)
+        ),
+    ):
+        segments = transcriber.transcribe("1.wav", surah_id=1)
 
     assert len(segments) == 1
     assert segments[0].text == "اَلْحَمْدُ لِلَّهِ"
@@ -263,28 +286,35 @@ def test_server_run_job_model_size_resolution(
     mock_transcriber.set_model_name.assert_called_with("large-v2")
 
 
-def test_server_get_ctc_transcriber_requires_paths(monkeypatch):
+def test_server_get_ctc_transcriber_raises_configuration_error_when_unavailable(monkeypatch):
+    """Missing model assets must surface a controlled ConfigurationError
+    (mapped to a structured 422 by the job runner), not a raw ValueError."""
     import server
 
     monkeypatch.setattr(server, "_ctc_transcriber", None)
-    mock_settings = MagicMock()
-    mock_settings.fastconformer_model_path = None
-    mock_settings.fastconformer_tokenizer_model_path = None
-    with patch("server.get_settings", return_value=mock_settings):
-        with pytest.raises(ValueError, match="MUNAJJAM_FASTCONFORMER_MODEL_PATH"):
-            server._get_ctc_transcriber()
+    with (
+        patch(
+            "munajjam.transcription.whisperFactory.resolve_fastconformer_assets",
+            side_effect=ConfigurationError("FastConformer CTC model assets are not available"),
+        ),
+        pytest.raises(ConfigurationError, match="not available"),
+    ):
+        server._get_ctc_transcriber()
 
 
 def test_server_get_ctc_transcriber_returns_lazy_transcriber(monkeypatch):
     import server
 
     monkeypatch.setattr(server, "_ctc_transcriber", None)
-    mock_settings = MagicMock()
-    mock_settings.fastconformer_model_path = "/models/ctc.onnx"
-    mock_settings.fastconformer_vocab_path = "/models/vocab.txt"
-    mock_settings.fastconformer_tokenizer_model_path = "/models/tokenizer.model"
-    mock_settings.fastconformer_vad_enabled = False
-    with patch("server.get_settings", return_value=mock_settings):
+    assets = FastConformerAssets(
+        model_path=Path("/models/ctc.onnx"),
+        tokenizer_model_path=Path("/models/tokenizer.model"),
+        vocab_path=Path("/models/vocab.txt"),
+    )
+    with patch(
+        "munajjam.transcription.whisperFactory.resolve_fastconformer_assets",
+        return_value=assets,
+    ):
         transcriber = server._get_ctc_transcriber()
     assert isinstance(transcriber, FastConformerCTCTranscriber)
 
@@ -317,6 +347,66 @@ def test_server_ctc_job_error_surfaces(mock_exists, monkeypatch):
     assert "no tokenizer configured" in server.jobs["ctc_job_err"]["error"]
 
 
+def test_server_ctc_job_configuration_error_maps_to_422(monkeypatch):
+    """Unavailable model assets must yield a structured error with a 4xx
+    status code, not an unhandled ValueError / 500."""
+    import server
+
+    monkeypatch.setattr(server, "_ctc_transcriber", None)
+    with patch(
+        "server._get_ctc_transcriber",
+        side_effect=ConfigurationError(
+            "FastConformer CTC model assets are not available and no automatic "
+            "download source is configured"
+        ),
+    ), patch("server.os.path.exists", return_value=False):
+        server.jobs["ctc_cfg_err"] = {"status": "queued"}
+        server._run_ctc_job("ctc_cfg_err", "dummy.mp3", 1)
+
+    job = server.jobs["ctc_cfg_err"]
+    assert job["status"] == "error"
+    assert job["status_code"] == 422
+    assert "not available" in job["error"]
+    assert "Traceback" not in job["error"]
+
+
+def test_server_ctc_job_unexpected_error_is_generic(monkeypatch):
+    """Unexpected exceptions must not leak internals to the client."""
+    import server
+
+    monkeypatch.setattr(server, "_ctc_transcriber", None)
+    with patch("server._get_ctc_transcriber", side_effect=RuntimeError("boom")), patch(
+        "server.os.path.exists", return_value=False
+    ):
+        server.jobs["ctc_crash"] = {"status": "queued"}
+        server._run_ctc_job("ctc_crash", "dummy.mp3", 1)
+
+    job = server.jobs["ctc_crash"]
+    assert job["status"] == "error"
+    assert job["status_code"] == 500
+    assert "Internal server error" in job["error"]
+    assert "boom" not in job["error"]
+
+
+def test_server_status_endpoint_uses_error_status_code(monkeypatch, tmp_path):
+    import server
+
+    monkeypatch.chdir(tmp_path)
+    server.jobs["cfg_job"] = {
+        "status": "error",
+        "data": None,
+        "error": "FastConformer CTC model assets are not available",
+        "status_code": 422,
+    }
+    with TestClient(server.app) as client:
+        resp = client.get("/align/status/cfg_job")
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "status": "error",
+        "message": "FastConformer CTC model assets are not available",
+    }
+
+
 def test_align_audio_invalid_alignment_mode_400(monkeypatch, tmp_path):
     import server
 
@@ -340,13 +430,12 @@ def test_align_audio_ctc_mode_queued(monkeypatch, tmp_path):
     fake.transcribe.return_value = []
     with patch("server._get_ctc_transcriber", return_value=fake), patch(
         "server.os.path.exists", return_value=False
-    ):
-        with TestClient(server.app) as client:
-            resp = client.post(
-                "/align/1",
-                files={"file": ("a.wav", b"data", "audio/wav")},
-                data={"alignment_mode": "ctc_segmentation"},
-            )
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/align/1",
+            files={"file": ("a.wav", b"data", "audio/wav")},
+            data={"alignment_mode": "ctc_segmentation"},
+        )
     assert resp.status_code == 200
     assert resp.json()["status"] == "queued"
     job_id = resp.json()["job_id"]
@@ -363,13 +452,12 @@ def test_align_audio_default_mode_stays_whisperx(monkeypatch, tmp_path):
     mock_transcriber.model_name = "large-v2"
     with patch("server.global_transcriber", mock_transcriber), patch(
         "server.os.path.exists", return_value=False
-    ):
-        with TestClient(server.app) as client:
-            # No alignment_mode -> default WhisperX behavior (backward compat)
-            resp = client.post(
-                "/align/1",
-                files={"file": ("a.wav", b"data", "audio/wav")},
-            )
+    ), TestClient(server.app) as client:
+        # No alignment_mode -> default WhisperX behavior (backward compat)
+        resp = client.post(
+            "/align/1",
+            files={"file": ("a.wav", b"data", "audio/wav")},
+        )
     assert resp.status_code == 200
     assert resp.json()["status"] == "queued"
     job_id = resp.json()["job_id"]

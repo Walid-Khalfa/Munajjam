@@ -99,6 +99,28 @@ class MunajjamSettings(BaseSettings):
         "alignments. Default is False (conservative).",
     )
 
+    fastconformer_cache_dir: str | None = Field(
+        default=None,
+        description="Directory where FastConformer CTC assets are "
+        "auto-provisioned. Defaults to ~/.cache/munajjam/fastconformer. "
+        "Cached files are reused without re-download.",
+    )
+
+    fastconformer_hf_repo_id: str | None = Field(
+        default=None,
+        description="Optional Hugging Face repo id hosting pre-exported "
+        "FastConformer CTC ONNX + SentencePiece assets. Only set this when "
+        "real assets exist in that repo (see "
+        "docs/fastconformer-onnx-validation.md); expected filenames: "
+        "stt_ar_fastconformer_hybrid_large_pc_v1.0_ctc_rawaudio.onnx and "
+        "tokenizer.model.",
+    )
+
+    fastconformer_hf_revision: str | None = Field(
+        default=None,
+        description="Optional revision/tag pin for fastconformer_hf_repo_id (defaults to 'main').",
+    )
+
     # ============ Audio Processing ============
 
     silence_threshold_db: int = Field(
