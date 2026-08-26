@@ -9,8 +9,10 @@ archives.
 from __future__ import annotations
 
 import io
+import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -148,6 +150,67 @@ def test_extract_assets_overwrites_with_force(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Tokenizer path from model_config.yaml
+# --------------------------------------------------------------------------- #
+class _YAMLError(Exception):
+    """Stand-in for yaml.YAMLError so tests never need real PyYAML."""
+
+
+_CONFIG = b"tokenizer:\n  model: abc_tokenizer.model\n"
+
+
+def test_tokenizer_path_from_config_valid_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PyYAML available + valid YAML -> the config-referenced path wins."""
+    fake_yaml = SimpleNamespace(
+        YAMLError=_YAMLError,
+        safe_load=lambda b: {"tokenizer": {"model": "abc_tokenizer.model"}},
+    )
+    monkeypatch.setitem(sys.modules, "yaml", fake_yaml)
+
+    assert exporter._tokenizer_path_from_config(_CONFIG) == "abc_tokenizer.model"
+
+
+def test_tokenizer_path_from_config_yaml_missing_uses_regex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PyYAML missing -> `import yaml` fails and the regex fallback works."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+    assert exporter._tokenizer_path_from_config(_CONFIG) == "abc_tokenizer.model"
+
+
+def test_tokenizer_path_from_config_malformed_yaml_uses_regex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed YAML -> yaml.YAMLError is handled and the regex fallback works."""
+
+    def _boom(_b):
+        raise _YAMLError("malformed")
+
+    fake_yaml = SimpleNamespace(YAMLError=_YAMLError, safe_load=_boom)
+    monkeypatch.setitem(sys.modules, "yaml", fake_yaml)
+
+    assert exporter._tokenizer_path_from_config(_CONFIG) == "abc_tokenizer.model"
+
+
+@pytest.mark.parametrize(
+    "parsed",
+    [
+        {"decoder": {"vocabulary": ["a", "b"]}},  # valid YAML, unexpected schema
+        ["not", "a", "mapping"],  # schema that makes .get() raise AttributeError
+    ],
+)
+def test_tokenizer_path_from_config_unexpected_schema_uses_regex(
+    monkeypatch: pytest.MonkeyPatch, parsed: object
+) -> None:
+    """Valid YAML with an unexpected schema -> regex fallback still works."""
+    fake_yaml = SimpleNamespace(YAMLError=_YAMLError, safe_load=lambda b: parsed)
+    monkeypatch.setitem(sys.modules, "yaml", fake_yaml)
+
+    assert exporter._tokenizer_path_from_config(_CONFIG) == "abc_tokenizer.model"
+
+
+# --------------------------------------------------------------------------- #
 # Export-time dependencies
 # --------------------------------------------------------------------------- #
 def test_import_export_deps_missing_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,3 +333,102 @@ def test_validate_onnx_rejects_wrong_input_names(tmp_path: Path, monkeypatch: py
 
     with pytest.raises(SystemExit, match="unexpected graph inputs"):
         exporter.validate_onnx(raw)
+
+
+class _FakeIO:
+    """Minimal NodeArg stand-in (name/type only)."""
+
+    def __init__(self, name: str, type_: str) -> None:
+        self.name = name
+        self.type = type_
+
+
+class _RecordingOrtSession:
+    """Fake onnxruntime session with configurable I/O dtypes that records
+    whether ``run()`` was invoked."""
+
+    def __init__(
+        self,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
+    ) -> None:
+        self._inputs = [
+            _FakeIO(exporter.INPUT_SIGNAL_NAME, "tensor(float)"),
+            _FakeIO(exporter.INPUT_LENGTH_NAME, "tensor(int32)"),
+        ]
+        self._outputs = [
+            _FakeIO(exporter.OUTPUT_LOGPROBS_NAME, "tensor(float)"),
+            _FakeIO(exporter.OUTPUT_LENGTH_NAME, "tensor(int64)"),
+        ]
+        if input_types is not None:
+            for io_, type_ in zip(self._inputs, input_types, strict=True):
+                io_.type = type_
+        if output_types is not None:
+            for io_, type_ in zip(self._outputs, output_types, strict=True):
+                io_.type = type_
+        self.run_called = False
+
+    def get_inputs(self) -> list[_FakeIO]:
+        return self._inputs
+
+    def get_outputs(self) -> list[_FakeIO]:
+        return self._outputs
+
+    def run(self, output_names, input_feed) -> list[object]:
+        import numpy as np
+
+        self.run_called = True
+        return [np.zeros((1, 2, 1025), dtype=np.float32), np.array([2], dtype=np.int64)]
+
+
+def _install_fake_ort(
+    monkeypatch: pytest.MonkeyPatch, session: _RecordingOrtSession
+) -> None:
+    fake_ort = MagicMock()
+    fake_ort.InferenceSession.return_value = session
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+
+@pytest.mark.parametrize(
+    ("input_types", "output_types", "bad_tensor"),
+    [
+        # All documented dtypes -> validation proceeds and inference runs.
+        (None, None, None),
+        # Wrong signal dtype -> rejected before inference.
+        (["tensor(int32)", "tensor(int32)"], None, exporter.INPUT_SIGNAL_NAME),
+        # Wrong length dtype -> rejected before inference.
+        (["tensor(float)", "tensor(int64)"], None, exporter.INPUT_LENGTH_NAME),
+        # Wrong logprobs dtype -> rejected before inference.
+        (None, ["tensor(int64)", "tensor(int64)"], exporter.OUTPUT_LOGPROBS_NAME),
+        # Wrong encoded_lengths dtype -> rejected before inference.
+        (None, ["tensor(float)", "tensor(int32)"], exporter.OUTPUT_LENGTH_NAME),
+    ],
+    ids=[
+        "documented_dtypes_proceed",
+        "wrong_signal_dtype",
+        "wrong_length_dtype",
+        "wrong_logprobs_dtype",
+        "wrong_encoded_lengths_dtype",
+    ],
+)
+def test_validate_onnx_io_dtypes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_types: list[str] | None,
+    output_types: list[str] | None,
+    bad_tensor: str | None,
+) -> None:
+    raw = tmp_path / f"{STEM}_ctc_rawaudio.onnx"
+    raw.write_bytes(b"onnx")
+    session = _RecordingOrtSession(input_types=input_types, output_types=output_types)
+    _install_fake_ort(monkeypatch, session)
+
+    if bad_tensor is None:
+        exporter.validate_onnx(raw)
+        assert session.run_called, "shape validation must still run after dtype checks"
+    else:
+        with pytest.raises(SystemExit, match="unexpected type for ONNX tensor") as exc:
+            exporter.validate_onnx(raw)
+        assert bad_tensor in str(exc.value)
+        assert "expected" in str(exc.value)
+        assert session.run_called is False, "no inference on a dtype mismatch"

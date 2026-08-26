@@ -63,6 +63,15 @@ OUTPUT_LENGTH_NAME = "encoded_lengths"      # int64   [B] true frame count
 SAMPLE_RATE = 16000
 DEFAULT_OPSET = 18
 
+# Documented I/O types of the production raw-audio graph (NodeArg.type),
+# validated by validate_onnx() before any inference is run.
+EXPECTED_IO_TYPES = {
+    INPUT_SIGNAL_NAME: "tensor(float)",
+    INPUT_LENGTH_NAME: "tensor(int32)",
+    OUTPUT_LOGPROBS_NAME: "tensor(float)",
+    OUTPUT_LENGTH_NAME: "tensor(int64)",
+}
+
 STOCK_ONNX_SUFFIX = "_ctc.onnx"
 RAW_AUDIO_ONNX_SUFFIX = "_ctc_rawaudio.onnx"
 TOKENIZER_FILENAME = "tokenizer.model"
@@ -160,15 +169,20 @@ def _tokenizer_path_from_config(config_bytes: bytes) -> str | None:
     """
     try:
         import yaml
+    except ImportError:
+        # PyYAML is optional; the regex fallback below still works without it.
+        yaml = None
 
-        cfg = yaml.safe_load(config_bytes)
-        tokenizer = (cfg or {}).get("tokenizer") or {}
-        value = tokenizer.get("model") or tokenizer.get("dir")
-        if isinstance(value, str):
-            return value.strip()
-    except (yaml.YAMLError, AttributeError, TypeError):
-        # Fall back to the regex below (e.g. PyYAML missing or schema drift).
-        pass
+    if yaml is not None:
+        try:
+            cfg = yaml.safe_load(config_bytes)
+            tokenizer = (cfg or {}).get("tokenizer") or {}
+            value = tokenizer.get("model") or tokenizer.get("dir")
+            if isinstance(value, str):
+                return value.strip()
+        except (yaml.YAMLError, AttributeError, TypeError):
+            # Malformed YAML or an unexpected schema: fall back to the regex.
+            pass
 
     for line in config_bytes.decode("utf-8", errors="replace").splitlines():
         stripped = line.strip()
@@ -414,9 +428,11 @@ def export_onnx_graphs(
 def validate_onnx(raw_onnx: Path) -> None:
     """Run a tiny sanity inference on the exported raw-audio graph.
 
-    Checks the I/O contract: float32 waveform + int32 length inputs and the
-    ``logprobs`` / ``encoded_lengths`` outputs, including the trailing blank
-    class (V+1 = 1025 for the reference model).
+    Checks the I/O contract before running: input/output tensor names and
+    ``NodeArg.type`` metadata (float32 waveform + int32 length inputs,
+    float32 ``logprobs`` + int64 ``encoded_lengths`` outputs), then runs a
+    short inference and validates the output shapes, including the trailing
+    blank class (V+1 = 1025 for the reference model).
 
     Raises:
         SystemExit: if the graph does not satisfy the expected contract.
@@ -441,6 +457,27 @@ def validate_onnx(raw_onnx: Path) -> None:
                 f"{sorted(inputs)}; expected {INPUT_SIGNAL_NAME} and "
                 f"{INPUT_LENGTH_NAME}."
             )
+
+        outputs_meta = {o.name: o for o in session.get_outputs()}
+        if set(outputs_meta) != {OUTPUT_LOGPROBS_NAME, OUTPUT_LENGTH_NAME}:
+            raise SystemExit(
+                "ERROR: unexpected graph outputs "
+                f"{sorted(outputs_meta)}; expected {OUTPUT_LOGPROBS_NAME} and "
+                f"{OUTPUT_LENGTH_NAME}."
+            )
+
+        # Validate the documented I/O dtype contract (NodeArg.type) BEFORE
+        # running inference, so a dtype mismatch is reported with an actionable
+        # message naming the tensor, its actual type and the expected type
+        # instead of a generic runtime feed error.
+        nodes = {**inputs, **outputs_meta}
+        for name, expected in EXPECTED_IO_TYPES.items():
+            actual = str(getattr(nodes[name], "type", ""))
+            if actual != expected:
+                raise SystemExit(
+                    f"ERROR: unexpected type for ONNX tensor {name!r}: "
+                    f"got {actual!r}, expected {expected!r}."
+                )
 
         signal = np.zeros((1, 1600), dtype=np.float32)  # 0.1 s @ 16 kHz
         length = np.array([1600], dtype=np.int32)
