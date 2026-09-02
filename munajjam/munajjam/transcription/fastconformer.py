@@ -189,18 +189,23 @@ def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE
     # 7. Log with floor guard
     log_mel = np.log(mel_spec + LOG_FLOOR)      # [n_frames, n_mels]
 
-    # 8. Per-channel (per-feature) mean/variance normalisation
-    #    NeMo uses ddof=1 (Bessel correction) in torch.std(), then
-    #    replaces NaN std (from single-frame inputs) with 0.0.
-    #    We compute variance manually to avoid numpy's RuntimeWarning
-    #    when ddof >= n (single-frame edge case).
-    mean = log_mel.mean(axis=0, keepdims=True)
-    n_frames = log_mel.shape[0]
-    variance = np.sum((log_mel - mean) ** 2, axis=0, keepdims=True) / max(n_frames - 1, 1)
+    # 8. Per-channel (per-feature) mean/variance normalisation.
+    #    NeMo's ``get_seq_len`` computes valid frame count as
+    #    ``ceil(n_samples / hop_length)``.  With centre-padded STFT the
+    #    actual frame count is ``1 + n_samples // hop_length`` (one extra).
+    #    NeMo normalises over only the valid frames and masks the rest to 0.
+    n_valid = int(np.ceil(waveform.size / HOP_LENGTH))
+    valid = log_mel[:n_valid]                   # [n_valid, n_mels]
+    mean = valid.mean(axis=0, keepdims=True)
+    variance = np.sum((valid - mean) ** 2, axis=0, keepdims=True) / max(n_valid - 1, 1)
     std = np.sqrt(variance)
     std = np.where(np.isnan(std), 0.0, std)  # single-frame edge case
     std = std + 1e-5
     log_mel = (log_mel - mean) / std
+
+    # Mask frames beyond n_valid to 0 (matching NeMo's seq_len masking)
+    if log_mel.shape[0] > n_valid:
+        log_mel[n_valid:] = 0.0
 
     # 9. Transpose to [n_mels, n_frames] and add batch dim
     return log_mel.T[np.newaxis, ...].astype(np.float32)
@@ -213,18 +218,36 @@ def _mel_filterbank(
 
     Reproduces ``librosa.filters.mel(..., norm="slaney")`` with pure numpy
     so the runtime has no librosa dependency for preprocessing.
+
+    Uses the Slaney/Auditory Toolbox mel scale (``librosa``'s default when
+    ``htk=False``), **not** the HTK formula.  Below 1 kHz the scale is
+    linear; above 1 kHz it is logarithmic.
     """
-    # Mel-scale conversion (HTK formula, matching librosa default)
-    def _hz_to_mel(f: float) -> float:
-        return 2595.0 * np.log10(1.0 + f / 700.0)
+    # --- Slaney mel-scale conversion (librosa htk=False) ---
+    _MIN_LOG_HZ = 1000.0
+    _MIN_LOG_MEL = _MIN_LOG_HZ / 700.0          # ≈ 1.4286
+    _LOGSTEP = np.log(6.4) / 27.0               # ≈ 0.06875
 
-    def _mel_to_hz(m: float) -> float:
-        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+    def _hz_to_mel(f: np.ndarray) -> np.ndarray:
+        f = np.asarray(f, dtype=np.float64)
+        mel = np.empty_like(f)
+        low = f < _MIN_LOG_HZ
+        mel[low] = f[low] / 700.0
+        mel[~low] = _MIN_LOG_MEL + np.log(f[~low] / _MIN_LOG_HZ) / _LOGSTEP
+        return mel
 
-    mel_min = _hz_to_mel(fmin)
-    mel_max = _hz_to_mel(fmax)
+    def _mel_to_hz(mel: np.ndarray) -> np.ndarray:
+        mel = np.asarray(mel, dtype=np.float64)
+        hz = np.empty_like(mel)
+        below = mel < _MIN_LOG_MEL
+        hz[below] = 700.0 * mel[below]
+        hz[~below] = _MIN_LOG_HZ * np.exp(_LOGSTEP * (mel[~below] - _MIN_LOG_MEL))
+        return hz
+
+    mel_min = _hz_to_mel(np.array([fmin]))[0]
+    mel_max = _hz_to_mel(np.array([fmax]))[0]
     mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
-    hz_points = np.array([_mel_to_hz(m) for m in mel_points])
+    hz_points = _mel_to_hz(mel_points)
 
     # Frequency bins for rfft
     freq_bins = np.linspace(0, sample_rate / 2, n_fft // 2 + 1)
