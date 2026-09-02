@@ -705,6 +705,72 @@ class TestSTFTExportFailureRegression:
 
 
 # --------------------------------------------------------------------------- #
+# Hann window regression test
+# --------------------------------------------------------------------------- #
+
+
+class TestHannWindowFormula:
+    """Verify our Hann window matches torch.hann_window(periodic=False).
+
+    For periodic=False the symmetric window formula uses denominator N-1:
+        w[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
+    """
+
+    @staticmethod
+    def _torch_available() -> bool:
+        import importlib.util
+        return importlib.util.find_spec("torch") is not None
+
+    @pytest.mark.skipif(
+        not _torch_available.__func__(),  # type: ignore[attr-defined]
+        reason="torch not installed",
+    )
+    def test_hann_window_matches_torch_periodic_false(self):
+        """Our Hann window must match torch.hann_window(N, periodic=False)."""
+        import torch
+        from munajjam.transcription.fastconformer import WIN_LENGTH
+
+        torch_win = torch.hann_window(WIN_LENGTH, periodic=False).numpy()
+        our_win = (
+            0.5
+            - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / (WIN_LENGTH - 1))
+        ).astype(np.float32)
+
+        mae = float(np.mean(np.abs(torch_win - our_win)))
+        maxae = float(np.max(np.abs(torch_win - our_win)))
+        assert mae < 1e-6, (
+            f"Hann window MAE={mae:.2e} vs torch.hann_window(periodic=False), "
+            f"MaxAE={maxae:.2e}"
+        )
+
+    @pytest.mark.skipif(
+        not _torch_available.__func__(),  # type: ignore[attr-defined]
+        reason="torch not installed",
+    )
+    def test_hann_window_wrong_formula_detected(self):
+        """Ensure the old /N (periodic) formula is NOT used.
+
+        The periodic form (denominator N) must differ from
+        torch.hann_window(N, periodic=False) — this guards against
+        regressing back to the wrong formula.
+        """
+        import torch
+        from munajjam.transcription.fastconformer import WIN_LENGTH
+
+        torch_win = torch.hann_window(WIN_LENGTH, periodic=False).numpy()
+        wrong_win = (
+            0.5
+            - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / WIN_LENGTH)
+        ).astype(np.float32)
+
+        wrong_mae = float(np.mean(np.abs(torch_win - wrong_win)))
+        assert wrong_mae > 1e-4, (
+            f"Old /N formula (MAE={wrong_mae:.2e}) should NOT match "
+            f"torch.hann_window(periodic=False)"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # NeMo numerical equivalence integration test
 # --------------------------------------------------------------------------- #
 # This test requires torch + nemo_toolkit.  It is skipped in normal unit-test

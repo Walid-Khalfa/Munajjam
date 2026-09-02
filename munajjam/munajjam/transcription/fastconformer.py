@@ -162,7 +162,8 @@ def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE
     emphasized[1:] = waveform[1:] - PREEMPH * waveform[:-1]
 
     # 2. Hann window (non-periodic, matching torch.hann_window(periodic=False))
-    window = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / WIN_LENGTH)
+    #    For periodic=False: N = window_length - 1, so denominator is WIN_LENGTH - 1.
+    window = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / (WIN_LENGTH - 1))
     # PyTorch pads win_length window on BOTH sides to n_fft before applying:
     #   "If win_length < n_fft, window will be padded on both sides to
     #   length n_fft before being applied."
