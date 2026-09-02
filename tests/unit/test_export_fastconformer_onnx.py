@@ -432,3 +432,119 @@ def test_validate_onnx_io_dtypes(
         assert bad_tensor in str(exc.value)
         assert "expected" in str(exc.value)
         assert session.run_called is False, "no inference on a dtype mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: Blocker #1 — stock export must receive ".onnx" path
+# --------------------------------------------------------------------------- #
+def _make_fake_torch() -> MagicMock:
+    """Build a fake torch module whose nn.Module has normal attribute semantics.
+
+    When ``torch.nn.Module`` is a ``MagicMock``, the wrapper class inherits
+    magic behaviour that interferes with ``self.x = y`` assignments.  Using a
+    plain stand-in class avoids that problem while keeping the rest mocked.
+    """
+
+    class _FakeModule:
+        """Minimal stand-in so ``class Foo(torch.nn.Module)`` works naturally."""
+
+    fake = MagicMock()
+    fake.nn.Module = _FakeModule
+    fake.randn.return_value = MagicMock()
+    fake.tensor.return_value = MagicMock()
+    return fake
+
+
+def _create_stock_side_effect(path_str: str) -> None:
+    """Side effect for ``model.export()`` that creates the stock ONNX file."""
+    Path(path_str).write_bytes(b"onnx")
+
+
+def test_stock_export_receives_onnx_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """model.export() must be called with the full .onnx path, not a
+    stripped path without extension. NeMo uses the extension to determine
+    the export format."""
+    stem = "stt_ar_fastconformer_hybrid_large_pc_v1.0"
+    stock_path = tmp_path / f"{stem}{exporter.STOCK_ONNX_SUFFIX}"
+
+    fake_torch = _make_fake_torch()
+    fake_nemo = MagicMock()
+    fake_model = fake_nemo.models.EncDecHybridRNNTCTCBPEModel.restore_from.return_value
+    fake_model.export.side_effect = _create_stock_side_effect
+    monkeypatch.setattr(exporter, "_import_export_deps", lambda: (fake_torch, fake_nemo))
+
+    exporter.export_onnx_graphs(
+        tmp_path / f"{stem}.nemo", tmp_path, force=True
+    )
+
+    fake_model.export.assert_called_once()
+    exported_path = fake_model.export.call_args[0][0]
+    assert exported_path.endswith(".onnx"), (
+        f"NeMo export must receive a path ending in '.onnx', got: {exported_path}"
+    )
+    assert exported_path == str(stock_path), (
+        f"Expected stock path {stock_path}, got: {exported_path}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Regression: Blocker #2 — CTC decoder attribute resolution
+# --------------------------------------------------------------------------- #
+def _run_export_with_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_model):
+    """Helper: run export_onnx_graphs with a pre-configured fake model."""
+    stem = "stt_ar_fastconformer_hybrid_large_pc_v1.0"
+    fake_torch = _make_fake_torch()
+    fake_nemo = MagicMock()
+    fake_nemo.models.EncDecHybridRNNTCTCBPEModel.restore_from.return_value = fake_model
+    fake_model.export.side_effect = _create_stock_side_effect
+    monkeypatch.setattr(exporter, "_import_export_deps", lambda: (fake_torch, fake_nemo))
+
+    exporter.export_onnx_graphs(
+        tmp_path / f"{stem}.nemo", tmp_path, force=True
+    )
+    return fake_torch
+
+
+def test_wrapper_uses_ctc_decoder_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RawAudioFastConformer must prefer traced.ctc_decoder over
+    traced.aux_ctc.decoder (which is a Hydra config key, not a submodule)."""
+    fake_model = MagicMock()
+    fake_model.ctc_decoder = MagicMock(name="ctc_decoder_module")
+
+    fake_torch = _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+    fake_torch.onnx.export.assert_called_once()
+    wrapper = fake_torch.onnx.export.call_args[0][0]
+    assert wrapper.ctc_decoder is fake_model.ctc_decoder
+
+
+def test_wrapper_falls_back_to_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ctc_decoder is absent, the wrapper should fall back to decoder."""
+    fake_model = MagicMock(
+        spec=["preprocessor", "encoder", "decoder", "export", "change_decoding_strategy"]
+    )
+    fake_model.decoder = MagicMock(name="decoder_module")
+
+    fake_torch = _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+    wrapper = fake_torch.onnx.export.call_args[0][0]
+    assert wrapper.ctc_decoder is fake_model.decoder
+
+
+def test_wrapper_raises_when_no_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When neither ctc_decoder nor decoder exists, a clear AttributeError
+    must be raised instead of an obscure later failure."""
+    fake_model = MagicMock(
+        spec=["preprocessor", "encoder", "export", "change_decoding_strategy"]
+    )
+
+    with pytest.raises((AttributeError, RuntimeError), match="neither 'ctc_decoder' nor 'decoder'"):
+        _run_export_with_model(tmp_path, monkeypatch, fake_model)

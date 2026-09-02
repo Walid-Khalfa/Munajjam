@@ -343,15 +343,15 @@ def export_onnx_graphs(
     graphs: dict[str, Path] = {}
 
     # 1) Stock NeMo export (mel-input; informational only, not loaded by the
-    #    runtime). NeMo appends ".onnx" to the path it is given.
+    #    runtime). NeMo uses the file extension to determine the export format,
+    #    so the full ".onnx" path must be passed directly.
     stock_path = output_dir / f"{stem}{STOCK_ONNX_SUFFIX}"
     if stock_path.exists() and not force:
         raise SystemExit(
             f"ERROR: {stock_path} already exists. Re-run with --force to overwrite."
         )
-    stock_base = stock_path.with_suffix("")
     try:
-        model.export(str(stock_base))
+        model.export(str(stock_path))
     except Exception as e:
         raise RuntimeError(f"NeMo stock export failed: {e}") from e
     if not stock_path.is_file():
@@ -376,7 +376,17 @@ def export_onnx_graphs(
             super().__init__()
             self.preprocessor = traced.preprocessor
             self.encoder = traced.encoder
-            self.ctc_decoder = traced.aux_ctc.decoder
+
+            decoder = getattr(traced, "ctc_decoder", None)
+            if decoder is None:
+                decoder = getattr(traced, "decoder", None)
+            if decoder is None:
+                raise AttributeError(
+                    "FastConformer model exposes neither 'ctc_decoder' nor "
+                    "'decoder'. The exported checkpoint may not be a hybrid "
+                    "RNNT/CTC model with the CTC head active."
+                )
+            self.ctc_decoder = decoder
 
         def forward(
             self,
