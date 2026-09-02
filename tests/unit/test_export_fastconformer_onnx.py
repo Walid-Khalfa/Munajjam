@@ -211,6 +211,78 @@ def test_tokenizer_path_from_config_unexpected_schema_uses_regex(
 
 
 # --------------------------------------------------------------------------- #
+# Tokenizer regex fallback — indentation-aware scope tracking
+# --------------------------------------------------------------------------- #
+_MULTIPLE_MODEL_KEYS = b"""\
+encoder:
+  model: acoustic.model
+  n_layers: 17
+
+tokenizer:
+  dir: tokenizer_dir
+  model: tokenizer.model
+"""
+
+
+def test_regex_fallback_skips_non_tokenizer_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regex fallback must ignore ``model:`` entries outside the
+    ``tokenizer:`` mapping (e.g. ``encoder.model``)."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+    result = exporter._tokenizer_path_from_config(_MULTIPLE_MODEL_KEYS)
+    assert result == "tokenizer.model"
+
+
+def test_regex_fallback_uses_dir_when_no_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the tokenizer mapping has ``dir:`` but no ``model:``, the
+    fallback should return the ``dir`` value."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    yaml_bytes = b"tokenizer:\n  dir: /opt/tokenizer\n"
+
+    assert exporter._tokenizer_path_from_config(yaml_bytes) == "/opt/tokenizer"
+
+
+def test_regex_fallback_model_preferred_over_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both ``model:`` and ``dir:`` exist, ``model`` wins."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    yaml_bytes = b"tokenizer:\n  dir: /opt/tokenizer\n  model: tok.model\n"
+
+    assert exporter._tokenizer_path_from_config(yaml_bytes) == "tok.model"
+
+
+def test_regex_fallback_exits_tokenizer_on_indent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the ``tokenizer:`` block ends, entries in sibling mappings
+    must be ignored."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    yaml_bytes = (
+        b"tokenizer:\n"
+        b"  model: tok.model\n"
+        b"decoder:\n"
+        b"  model: acoustic.model\n"
+    )
+
+    assert exporter._tokenizer_path_from_config(yaml_bytes) == "tok.model"
+
+
+def test_regex_fallback_no_tokenizer_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no ``tokenizer:`` section exists at all, return ``None``."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    yaml_bytes = b"encoder:\n  model: acoustic.model\n"
+
+    assert exporter._tokenizer_path_from_config(yaml_bytes) is None
+
+
+# --------------------------------------------------------------------------- #
 # Export-time dependencies
 # --------------------------------------------------------------------------- #
 def test_import_export_deps_missing_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:

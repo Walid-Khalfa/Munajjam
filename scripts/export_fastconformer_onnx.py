@@ -184,12 +184,53 @@ def _tokenizer_path_from_config(config_bytes: bytes) -> str | None:
             # Malformed YAML or an unexpected schema: fall back to the regex.
             pass
 
+    # Fallback: indentation-aware line scan (no PyYAML needed).
+    # Only accept ``model:`` / ``dir:`` entries that live inside a
+    # ``tokenizer:`` YAML mapping, using indentation to track scope.
+    in_tokenizer = False
+    tokenizer_indent = 0
+    result_model: str | None = None
+    result_dir: str | None = None
     for line in config_bytes.decode("utf-8", errors="replace").splitlines():
         stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        # Detect entry into a ``tokenizer:`` mapping.
+        key_part = stripped.split(":", 1)[0].strip()
+        if not in_tokenizer and key_part == "tokenizer":
+            in_tokenizer = True
+            tokenizer_indent = indent
+            continue
+
+        # Exit when indentation returns to the same or parent level.
+        if in_tokenizer and indent <= tokenizer_indent:
+            if result_model is not None:
+                return result_model
+            if result_dir is not None:
+                return result_dir
+            in_tokenizer = False
+
+        if not in_tokenizer:
+            continue
+
+        # Inside the tokenizer mapping — look for model / dir.
         if stripped.startswith("model:"):
             candidate = stripped.split(":", 1)[1].strip().strip("'\"")
             if candidate.endswith(".model"):
-                return candidate
+                result_model = candidate
+        elif stripped.startswith("dir:"):
+            candidate = stripped.split(":", 1)[1].strip().strip("'\"")
+            if candidate:
+                result_dir = candidate
+
+    # End of file — return what we collected (model preferred over dir).
+    if result_model is not None:
+        return result_model
+    if result_dir is not None:
+        return result_dir
     return None
 
 
