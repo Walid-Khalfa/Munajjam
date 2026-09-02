@@ -771,8 +771,111 @@ class TestHannWindowFormula:
 
 
 # --------------------------------------------------------------------------- #
-# NeMo numerical equivalence integration test
+# Mel filterbank regression test
 # --------------------------------------------------------------------------- #
+
+
+class TestMelFilterbankFormula:
+    """Verify our _mel_filterbank() matches librosa.filters.mel(norm='slaney').
+
+    Uses the Slaney/Auditory Toolbox mel scale (htk=False).
+    """
+
+    @staticmethod
+    def _librosa_available() -> bool:
+        import importlib.util
+        return importlib.util.find_spec("librosa") is not None
+
+    @pytest.mark.skipif(
+        not _librosa_available.__func__(),  # type: ignore[attr-defined]
+        reason="librosa not installed",
+    )
+    def test_mel_filterbank_matches_librosa(self):
+        """Our _mel_filterbank() must match librosa.filters.mel(norm='slaney')."""
+        import librosa.filters
+        from munajjam.transcription.fastconformer import (
+            DEFAULT_SAMPLE_RATE,
+            MEL_FMAX,
+            MEL_FMIN,
+            N_FFT,
+            N_MELS,
+            _mel_filterbank,
+        )
+
+        our_fb = _mel_filterbank(DEFAULT_SAMPLE_RATE, N_FFT, N_MELS, MEL_FMIN, MEL_FMAX)
+        librosa_fb = librosa.filters.mel(
+            sr=DEFAULT_SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS,
+            fmin=MEL_FMIN, fmax=MEL_FMAX, htk=False, norm="slaney",
+        )
+
+        mae = float(np.mean(np.abs(our_fb - librosa_fb)))
+        maxae = float(np.max(np.abs(our_fb - librosa_fb)))
+        assert mae < 1e-6, (
+            f"Mel filterbank MAE={mae:.2e} vs librosa(norm='slaney'), "
+            f"MaxAE={maxae:.2e}"
+        )
+
+    @pytest.mark.skipif(
+        not _librosa_available.__func__(),  # type: ignore[attr-defined]
+        reason="librosa not installed",
+    )
+    def test_mel_filterbank_wrong_scale_detected(self):
+        """Ensure the old HTK-scale mel (using 700) does NOT match Slaney."""
+        import librosa.filters
+        from munajjam.transcription.fastconformer import (
+            DEFAULT_SAMPLE_RATE,
+            MEL_FMAX,
+            MEL_FMIN,
+            N_FFT,
+            N_MELS,
+        )
+
+        librosa_fb = librosa.filters.mel(
+            sr=DEFAULT_SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS,
+            fmin=MEL_FMIN, fmax=MEL_FMAX, htk=False, norm="slaney",
+        )
+
+        # Reproduce the old wrong mel filterbank (using 700 for linear part)
+        import numpy as np
+        _MIN_LOG_HZ = 1000.0
+        _MIN_LOG_MEL_WRONG = _MIN_LOG_HZ / 700.0
+        _LOGSTEP = np.log(6.4) / 27.0
+
+        def _hz_to_mel_wrong(f):
+            f = np.asarray(f, dtype=np.float64)
+            mel = np.empty_like(f)
+            low = f < _MIN_LOG_HZ
+            mel[low] = f[low] / 700.0
+            mel[~low] = _MIN_LOG_MEL_WRONG + np.log(f[~low] / _MIN_LOG_HZ) / _LOGSTEP
+            return mel
+
+        def _mel_to_hz_wrong(m):
+            m = np.asarray(m, dtype=np.float64)
+            hz = np.empty_like(m)
+            below = m < _MIN_LOG_MEL_WRONG
+            hz[below] = 700.0 * m[below]
+            hz[~below] = _MIN_LOG_HZ * np.exp(_LOGSTEP * (m[~below] - _MIN_LOG_MEL_WRONG))
+            return hz
+
+        mel_min = _hz_to_mel_wrong(np.array([MEL_FMIN]))[0]
+        mel_max = _hz_to_mel_wrong(np.array([MEL_FMAX]))[0]
+        mel_points = np.linspace(mel_min, mel_max, N_MELS + 2)
+        hz_points = _mel_to_hz_wrong(mel_points)
+        freq_bins = np.linspace(0, DEFAULT_SAMPLE_RATE / 2, N_FFT // 2 + 1)
+        wrong_fb = np.zeros((N_MELS, N_FFT // 2 + 1), dtype=np.float32)
+        for i in range(N_MELS):
+            low, center, high = hz_points[i], hz_points[i + 1], hz_points[i + 2]
+            rising = (freq_bins - low) / (center - low + 1e-10)
+            falling = (high - freq_bins) / (high - center + 1e-10)
+            wrong_fb[i] = np.maximum(0.0, np.minimum(rising, falling))
+        enorm = 2.0 / (hz_points[2:] - hz_points[:-2] + 1e-10)
+        wrong_fb *= enorm[:, np.newaxis]
+
+        wrong_mae = float(np.mean(np.abs(wrong_fb - librosa_fb)))
+        assert wrong_mae > 1e-5, (
+            f"Old HTK-scale mel (MAE={wrong_mae:.2e}) should NOT match "
+            f"librosa(norm='slaney')"
+        )
 # This test requires torch + nemo_toolkit.  It is skipped in normal unit-test
 # runs (where those are not installed) and expected to run in the Colab
 # validation environment where both are available.

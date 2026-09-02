@@ -229,14 +229,15 @@ def _mel_filterbank(
     """
     # --- Slaney mel-scale conversion (librosa htk=False) ---
     _MIN_LOG_HZ = 1000.0
-    _MIN_LOG_MEL = _MIN_LOG_HZ / 700.0          # ≈ 1.4286
+    _F_SP = 200.0 / 3.0                          # ≈ 66.667  (linear spacing)
+    _MIN_LOG_MEL = _MIN_LOG_HZ / _F_SP           # = 15.0
     _LOGSTEP = np.log(6.4) / 27.0               # ≈ 0.06875
 
     def _hz_to_mel(f: np.ndarray) -> np.ndarray:
         f = np.asarray(f, dtype=np.float64)
         mel = np.empty_like(f)
         low = f < _MIN_LOG_HZ
-        mel[low] = f[low] / 700.0
+        mel[low] = f[low] / _F_SP
         mel[~low] = _MIN_LOG_MEL + np.log(f[~low] / _MIN_LOG_HZ) / _LOGSTEP
         return mel
 
@@ -244,7 +245,7 @@ def _mel_filterbank(
         mel = np.asarray(mel, dtype=np.float64)
         hz = np.empty_like(mel)
         below = mel < _MIN_LOG_MEL
-        hz[below] = 700.0 * mel[below]
+        hz[below] = _F_SP * mel[below]
         hz[~below] = _MIN_LOG_HZ * np.exp(_LOGSTEP * (mel[~below] - _MIN_LOG_MEL))
         return hz
 
