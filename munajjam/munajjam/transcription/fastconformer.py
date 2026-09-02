@@ -163,14 +163,17 @@ def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE
 
     # 2. Hann window (non-periodic, matching torch.hann_window(periodic=False))
     window = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / WIN_LENGTH)
-    # Zero-pad window to N_FFT so it can be applied to N_FFT-sized frames
-    # (torch.stft extracts n_fft samples, applies win_length window, zero-pads rest)
+    # PyTorch pads win_length window on BOTH sides to n_fft before applying:
+    #   "If win_length < n_fft, window will be padded on both sides to
+    #   length n_fft before being applied."
     window_full = np.zeros(N_FFT, dtype=np.float32)
-    window_full[:WIN_LENGTH] = window
+    _win_offset = (N_FFT - WIN_LENGTH) // 2
+    window_full[_win_offset : _win_offset + WIN_LENGTH] = window
 
-    # 3. Pad for center STFT (pad n_fft//2 on each side, matching torch.stft center=True)
+    # 3. Pad for center STFT (pad n_fft//2 on each side, matching torch.stft
+    #    center=True, pad_mode="constant" as used by NeMo's FilterbankFeatures)
     pad_width = N_FFT // 2
-    padded = np.pad(emphasized, pad_width, mode="reflect")
+    padded = np.pad(emphasized, pad_width, mode="constant")
 
     # 4. STFT frame extraction — torch.stft(center=True) extracts n_fft-sized
     #    frames at positions 0, hop, 2*hop, ... from the center-padded signal.
