@@ -195,18 +195,17 @@ def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE
 
     # 8. Per-channel (per-feature) mean/variance normalisation.
     #    NeMo's ``get_seq_len`` computes valid frame count as
-    #    ``ceil(n_samples / hop_length)``.  With centre-padded STFT the
-    #    actual frame count is ``1 + n_samples // hop_length`` (one extra).
-    #    NeMo normalises over only the valid frames and masks the rest to 0.
-    n_valid = int(np.ceil(waveform.size / HOP_LENGTH))
-    valid = log_mel[:n_valid]                   # [n_valid, n_mels]
-    mean = valid.mean(axis=0, keepdims=True)
-    variance = np.sum((valid - mean) ** 2, axis=0, keepdims=True) / max(n_valid - 1, 1)
-    std = np.sqrt(variance)
-    std = np.where(np.isnan(std), 0.0, std)  # single-frame edge case
-    std = std + 1e-5
-    log_mel = (log_mel - mean) / std
-
+    #    ``floor(n_samples / hop_length)`` (for exact_pad=False).
+    #    Centre-padded STFT produces one extra frame; NeMo masks it out.
+    n_valid = waveform.size // HOP_LENGTH
+    if n_valid > 0:
+        valid = log_mel[:n_valid]                   # [n_valid, n_mels]
+        mean = valid.mean(axis=0, keepdims=True)
+        variance = np.sum((valid - mean) ** 2, axis=0, keepdims=True) / max(n_valid - 1, 1)
+        std = np.sqrt(variance)
+        std = np.where(np.isnan(std), 0.0, std)  # single-frame edge case
+        std = std + 1e-5
+        log_mel = (log_mel - mean) / std
     # Mask frames beyond n_valid to 0 (matching NeMo's seq_len masking)
     if log_mel.shape[0] > n_valid:
         log_mel[n_valid:] = 0.0

@@ -876,6 +876,39 @@ class TestMelFilterbankFormula:
             f"Old HTK-scale mel (MAE={wrong_mae:.2e}) should NOT match "
             f"librosa(norm='slaney')"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Valid-frame count regression test
+# --------------------------------------------------------------------------- #
+
+
+class TestValidFrameCount:
+    """Verify n_valid uses floor division, not ceil, matching NeMo's get_seq_len."""
+
+    @pytest.mark.parametrize(
+        "n_samples,expected",
+        [
+            (16000, 100),       # exact hop multiple
+            (49536, 309),       # Common Voice — floor(49536/160)=309, ceil=310
+            (161, 1),           # just above one hop
+            (160, 1),           # exactly one hop
+            (159, 0),           # below one hop — edge case
+            (320, 2),           # two hops exactly
+            (321, 2),           # just above two hops
+        ],
+    )
+    def test_valid_frame_count_floor(self, n_samples: int, expected: int):
+        """n_valid must equal n_samples // HOP_LENGTH (floor, not ceil)."""
+        from munajjam.transcription.fastconformer import HOP_LENGTH
+
+        waveform = np.zeros(n_samples, dtype=np.float32)
+        n_valid = waveform.size // HOP_LENGTH
+        assert n_valid == expected, (
+            f"n_samples={n_samples}: expected n_valid={expected}, got {n_valid}"
+        )
+
+
 # This test requires torch + nemo_toolkit.  It is skipped in normal unit-test
 # runs (where those are not installed) and expected to run in the Colab
 # validation environment where both are available.
