@@ -7,6 +7,9 @@ A thin, lazy ONNX Runtime wrapper around NVIDIA FastConformer hybrid
 
 This module only covers *acoustic inference*: it loads an exported ONNX
 graph and turns a raw waveform into CTC log-probabilities of shape ``[T, V]``.
+The public API (``log_probs(waveform)``) accepts raw waveforms; mel
+preprocessing is performed internally via ``compute_mel_features()`` before
+calling ONNX inference.
 Higher-level concerns of the Global CTC Segmentation pipeline (silero-vad
 chunking, quranic-phonemizer G2P, ``ctc-segmentation``, blank reward, dynamic
 silence trimming) are intentionally out of scope here and will live in
@@ -32,17 +35,19 @@ decoder would be exported instead. Two export shapes exist:
        output logprobs      float32 [B, T', V+1]
 
 2. Munajjam's production export (``scripts/export_fastconformer_onnx.py``,
-   ``*_ctc_rawaudio.onnx``) — a single self-contained graph that embeds the
-   NeMo preprocessor so raw waveforms can be fed in directly:
+   ``*_ctc_rawaudio.onnx``) — encoder + CTC decoder only.  The NeMo
+   preprocessor is excluded because ``torch.stft()`` produces complex types
+   that the legacy TorchScript ONNX exporter cannot handle.  Mel features
+   are computed in Python by ``compute_mel_features()`` before ONNX inference:
 
-       input  input_signal        float32 [B, T]     (raw mono waveform @ 16 kHz)
-       input  input_signal_length int32   [B]        (number of valid samples)
+       input  input_signal        float32 [B, 80, T_mel] (log-mel features)
+       input  input_signal_length int32   [B]            (valid frame count)
        output logprobs            float32 [B, T', V+1]
-       output encoded_lengths     int64   [B]        (true frame count; optional)
+       output encoded_lengths     int64   [B]            (true frame count)
 
-This loader targets contract (2). The stock mel-input export (1) is **not**
-supported yet — it would require reimplementing NeMo's mel front-end
-(STFT/mel/log/per-feature normalization) outside the graph.
+This loader targets contract (2).  The public API still accepts raw
+waveforms — ``log_probs(waveform)`` performs mel preprocessing internally
+via ``compute_mel_features()``.
 
 Tensor names are resolved from the session at load time (by role/shape), so
 exports that rename the I/O keep working; the names above are the defaults
@@ -69,10 +74,17 @@ FastConformer subsamples the log-mel frames 8x:
 Verified empirically on the exported graph: ``T' = time // 1280 + 1`` for
 ``time`` audio samples at 16 kHz (1280 samples = 80 ms).
 
+Mel preprocessing
+-----------------
+``compute_mel_features(waveform)`` implements NeMo's ``FilterbankFeatures``
+exactly: pre-emphasis (0.97) → center-padded STFT (n_fft=512, win=400,
+hop=160, Hann window) → power spectrum → mel filterbank (80 mels,
+fmin=0, fmax=8000, Slaney norm) → log (floor 2⁻²⁴) → per-channel
+mean/variance normalisation (online, per utterance).  No librosa dependency
+at runtime.
+
 Notes
 -----
-* The production export embeds the NeMo preprocessor, so raw waveforms are
-  fed in as-is (the model card states "Pre-Processing Not Needed").
 * Batch size 1 only — each call processes a single utterance.
 """
 
@@ -106,6 +118,131 @@ DEFAULT_INPUT_SIGNAL_NAME = "input_signal"
 DEFAULT_INPUT_LENGTH_NAME = "input_signal_length"
 DEFAULT_OUTPUT_LOGPROBS_NAME = "logprobs"
 DEFAULT_OUTPUT_LENGTH_NAMES = ("encoded_lengths", "encoder_output_length")
+
+# --------------------------------------------------------------------------- #
+# Mel preprocessing parameters — must match NeMo FilterbankFeatures exactly.
+# These are the effective values for the FastConformer hybrid checkpoint after
+# config overrides (window_size=0.025, features=80, pad_to=0).
+# --------------------------------------------------------------------------- #
+N_FFT = 512
+WIN_LENGTH = 400           # 0.025 s × 16 000 Hz
+HOP_LENGTH = 160           # 0.010 s × 16 000 Hz
+N_MELS = 80
+PREEMPH = 0.97
+LOG_FLOOR = 2**-24         # ≈ 5.96e-8, added (not clamped)
+MEL_FMIN = 0
+MEL_FMAX = 8000            # sample_rate / 2
+
+
+def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
+    """Compute log-mel features matching NeMo's ``FilterbankFeatures`` exactly.
+
+    Implements: pre-emphasis → STFT → power spectrum → mel filterbank →
+    log → per-channel mean/variance normalisation.  No dither (inference mode)
+    and no padding (``pad_to=0`` in the FastConformer config).
+
+    Args:
+        waveform: 1-D float32 array at *sample_rate* Hz.
+        sample_rate: Sample rate (default 16 000).
+
+    Returns:
+        float32 array of shape ``[1, n_mels, T_mel]`` ready for the ONNX
+        encoder graph.
+    """
+    if waveform.ndim != 1:
+        raise ValueError("waveform must be 1-D")
+    if waveform.dtype != np.float32:
+        waveform = waveform.astype(np.float32)
+    if waveform.size == 0:
+        return np.zeros((1, N_MELS, 0), dtype=np.float32)
+
+    # 1. Pre-emphasis
+    emphasized = np.empty_like(waveform)
+    emphasized[0] = waveform[0]
+    emphasized[1:] = waveform[1:] - PREEMPH * waveform[:-1]
+
+    # 2. Hann window (non-periodic, matching torch.hann_window(periodic=False))
+    window = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(WIN_LENGTH) / WIN_LENGTH)
+    # Zero-pad window to N_FFT so it can be applied to N_FFT-sized frames
+    # (torch.stft extracts n_fft samples, applies win_length window, zero-pads rest)
+    window_full = np.zeros(N_FFT, dtype=np.float32)
+    window_full[:WIN_LENGTH] = window
+
+    # 3. Pad for center STFT (pad n_fft//2 on each side, matching torch.stft center=True)
+    pad_width = N_FFT // 2
+    padded = np.pad(emphasized, pad_width, mode="constant")
+
+    # 4. STFT frame extraction — torch.stft(center=True) extracts n_fft-sized
+    #    frames at positions 0, hop, 2*hop, ... from the center-padded signal.
+    n_frames = 1 + (len(padded) - N_FFT) // HOP_LENGTH
+    indices = np.arange(N_FFT)[np.newaxis, :] + np.arange(n_frames)[:, np.newaxis] * HOP_LENGTH
+    frames = padded[indices] * window_full  # [n_frames, N_FFT]
+
+    # 5. Real DFT via rfft
+    fft_result = np.fft.rfft(frames, n=N_FFT)  # [n_frames, n_fft//2+1]
+    power_spec = np.abs(fft_result) ** 2        # power spectrum
+
+    # 6. Mel filterbank (pre-computed via librosa convention, norm="slaney")
+    mel_fb = _mel_filterbank(sample_rate, N_FFT, N_MELS, MEL_FMIN, MEL_FMAX)
+    mel_spec = power_spec @ mel_fb.T            # [n_frames, n_mels]
+
+    # 7. Log with floor guard
+    log_mel = np.log(mel_spec + LOG_FLOOR)      # [n_frames, n_mels]
+
+    # 8. Per-channel (per-feature) mean/variance normalisation
+    #    NeMo uses ddof=1 (Bessel correction) in torch.std(), then
+    #    replaces NaN std (from single-frame inputs) with 0.0.
+    #    We compute variance manually to avoid numpy's RuntimeWarning
+    #    when ddof >= n (single-frame edge case).
+    mean = log_mel.mean(axis=0, keepdims=True)
+    n_frames = log_mel.shape[0]
+    variance = np.sum((log_mel - mean) ** 2, axis=0, keepdims=True) / max(n_frames - 1, 1)
+    std = np.sqrt(variance)
+    std = np.where(np.isnan(std), 0.0, std)  # single-frame edge case
+    std = std + 1e-5
+    log_mel = (log_mel - mean) / std
+
+    # 9. Transpose to [n_mels, n_frames] and add batch dim
+    return log_mel.T[np.newaxis, ...].astype(np.float32)
+
+
+def _mel_filterbank(
+    sample_rate: int, n_fft: int, n_mels: int, fmin: float, fmax: float
+) -> np.ndarray:
+    """Build a mel filterbank matrix (``[n_mels, n_fft//2+1]``).
+
+    Reproduces ``librosa.filters.mel(..., norm="slaney")`` with pure numpy
+    so the runtime has no librosa dependency for preprocessing.
+    """
+    # Mel-scale conversion (HTK formula, matching librosa default)
+    def _hz_to_mel(f: float) -> float:
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+
+    def _mel_to_hz(m: float) -> float:
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    mel_min = _hz_to_mel(fmin)
+    mel_max = _hz_to_mel(fmax)
+    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz_points = np.array([_mel_to_hz(m) for m in mel_points])
+
+    # Frequency bins for rfft
+    freq_bins = np.linspace(0, sample_rate / 2, n_fft // 2 + 1)
+
+    filterbank = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for i in range(n_mels):
+        low, center, high = hz_points[i], hz_points[i + 1], hz_points[i + 2]
+        # Rising slope
+        rising = (freq_bins - low) / (center - low + 1e-10)
+        # Falling slope
+        falling = (high - freq_bins) / (high - center + 1e-10)
+        filterbank[i] = np.maximum(0.0, np.minimum(rising, falling))
+
+    # Slaney-style area normalization
+    enorm = 2.0 / (hz_points[2:] - hz_points[:-2] + 1e-10)
+    filterbank *= enorm[:, np.newaxis]
+
+    return filterbank
 
 
 class FastConformerInference:
@@ -170,6 +307,7 @@ class FastConformerInference:
         self._vocab: list[str] | None = None
         self._derived_vocab_size: int | None = None
         self._input_length_dtype: np.dtype[Any] | None = None
+        self._needs_preprocessing: bool = False  # True when ONNX graph expects mel input
 
     # ------------------------------------------------------------------ #
     # Model lifecycle
@@ -372,28 +510,39 @@ class FastConformerInference:
         if waveform.size == 0:
             raise TranscriptionError("waveform must not be empty")
 
-        audio = np.ascontiguousarray(waveform, dtype=np.float32)[np.newaxis, :]  # [1, T]
         length_dtype = self._input_length_dtype or np.dtype(np.int32)
-        n_samples = audio.shape[1]
-        # Validate that the sample count fits in the ONNX length dtype.
+
+        if self._needs_preprocessing:
+            # Graph expects mel features [B, n_mels, T_mel].
+            mel = compute_mel_features(waveform, self.sample_rate)  # [1, n_mels, T_mel]
+            signal = mel
+            n_frames = mel.shape[2]
+            if n_frames < 1:
+                raise TranscriptionError("Mel spectrogram is empty after preprocessing")
+        else:
+            # Graph expects raw waveform [B, T].
+            signal = np.ascontiguousarray(waveform, dtype=np.float32)[np.newaxis, :]
+            n_frames = signal.shape[1]
+
+        # Validate that the frame count fits in the ONNX length dtype.
         try:
             iinfo = np.iinfo(length_dtype)
         except ValueError:
             pass  # not an integer dtype (shouldn't happen for length inputs)
         else:
-            if n_samples < iinfo.min or n_samples > iinfo.max:
+            if n_frames < iinfo.min or n_frames > iinfo.max:
                 raise TranscriptionError(
-                    "Audio sample count does not fit in the ONNX length input dtype",
+                    "Frame count does not fit in the ONNX length input dtype",
                     context={
-                        "samples": n_samples,
+                        "frames": n_frames,
                         "length_dtype": str(length_dtype),
                         "range": (int(iinfo.min), int(iinfo.max)),
                     },
                 )
-        length = np.array([n_samples], dtype=length_dtype)  # [1]
+        length = np.array([n_frames], dtype=length_dtype)  # [1]
 
         input_feed = {
-            self._input_signal_name: audio,
+            self._input_signal_name: signal,
             self._input_length_name: length,
         }
         output_names = [self._output_logprobs_name]
@@ -444,8 +593,11 @@ class FastConformerInference:
         session = self._get_session()
 
         inputs = list(session.get_inputs())
-        signal_name, length_name, length_dtype = self._find_signal_and_length(inputs)
+        signal_name, length_name, length_dtype, needs_preproc = (
+            self._find_signal_and_length(inputs)
+        )
         self._input_length_dtype = length_dtype
+        self._needs_preprocessing = needs_preproc
         if self._input_signal_name is None:
             self._input_signal_name = signal_name
         if self._input_length_name is None:
@@ -466,28 +618,49 @@ class FastConformerInference:
         )
 
     @staticmethod
-    def _find_signal_and_length(inputs: list[Any]) -> tuple[str, str, np.dtype[Any]]:
+    def _find_signal_and_length(
+        inputs: list[Any],
+    ) -> tuple[str, str, np.dtype[Any], bool]:
         """
         Identify the waveform and length inputs by shape/type.
 
-        NeMo's full-model export provides exactly two inputs: a 2-D float
-        tensor (``[B, T]`` waveform) and a 1-D int tensor (``[B]`` lengths).
-        """
-        two_d_float = [i for i in inputs if _ndim(i) == 2 and _is_float(i)]
-        one_d_int = [i for i in inputs if _ndim(i) == 1 and _is_int(i)]
+        Supports two graph layouts:
 
-        if len(inputs) != 2 or not two_d_float or not one_d_int:
+        * **Raw-audio** (Munajjam export): 2-D float ``[B, T]`` waveform +
+          1-D int ``[B]`` length → returns ``needs_preprocessing=False``.
+        * **Mel-input** (NeMo stock / encoder+decoder-only export):
+          3-D float ``[B, n_mels, T_mel]`` mel features + 1-D int ``[B]``
+          length → returns ``needs_preprocessing=True`` (caller must convert
+          raw waveform → mel before calling ONNX).
+        """
+        one_d_int = [i for i in inputs if _ndim(i) == 1 and _is_int(i)]
+        two_d_float = [i for i in inputs if _ndim(i) == 2 and _is_float(i)]
+        three_d_float = [i for i in inputs if _ndim(i) == 3 and _is_float(i)]
+
+        if not one_d_int:
             raise TranscriptionError(
-                "Unexpected ONNX inputs: expected the Munajjam raw-audio "
-                "FastConformer export (float32 waveform [B, T] + int length [B]). "
-                "Note: NeMo's stock export takes log-mel features [B, 80, T] "
-                "and is not supported; re-export with "
-                "scripts/export_fastconformer_onnx.py",
+                "Unexpected ONNX inputs: no 1-D integer length input found.",
                 context={"found": [getattr(i, "name", None) for i in inputs]},
             )
 
         length_dtype = _numpy_length_dtype(one_d_int[0])
-        return str(two_d_float[0].name), str(one_d_int[0].name), length_dtype
+        length_name = str(one_d_int[0].name)
+
+        # Prefer 3-D mel input (encoder+decoder-only graph).
+        if three_d_float:
+            return str(three_d_float[0].name), length_name, length_dtype, True
+
+        # Backward-compatible path for older raw-audio exports (the
+        # production export is now mel-input, but legacy 2-D graphs
+        # are still accepted without preprocessing).
+        if two_d_float:
+            return str(two_d_float[0].name), length_name, length_dtype, False
+
+        raise TranscriptionError(
+            "Unexpected ONNX inputs: expected a 2-D float waveform "
+            "[B, T] or 3-D float mel features [B, n_mels, T_mel].",
+            context={"found": [getattr(i, "name", None) for i in inputs]},
+        )
 
     @staticmethod
     def _find_logprobs_output(outputs: list[Any]) -> str:

@@ -52,17 +52,24 @@ This produces (for ``stem = stt_ar_fastconformer_hybrid_large_pc_v1.0``):
 | File | Input | Output | Notes |
 |---|---|---|---|
 | `{stem}_ctc.onnx` (458 MB) | `audio_signal` f32 `[B, 80, T_mel]` (log-mel), `length` i64 `[B]` | `logprobs` f32 `[B, T', 1025]` | NeMo's *stock* export; the preprocessor is **not** in the graph |
-| `{stem}_ctc_rawaudio.onnx` (3 MB graph + `.onnx.data` weights) | `input_signal` f32 `[B, T]` (raw 16 kHz waveform), `input_signal_length` i32 `[B]` | `logprobs` f32 `[B, T', 1025]`, `encoded_lengths` i64 `[B]` | Munajjam *production* export; preprocessor + encoder + CTC head in one graph |
+| `{stem}_ctc_rawaudio.onnx` (3 MB graph + `.onnx.data` weights) | `input_signal` f32 `[B, 80, T_mel]` (log-mel features), `input_signal_length` i32 `[B]` (valid frame count) | `logprobs` f32 `[B, T', 1025]`, `encoded_lengths` i64 `[B]` | Munajjam *production* export; encoder + CTC head (mel-input); preprocessing in Python |
 | `tokenizer.model` | — | — | SentencePiece model extracted from the `.nemo` (deterministically, from `model_config.yaml`'s `tokenizer.model`) |
 | `vocabulary.txt` | — | — | Labels dump extracted from the archive when present (optional) |
 
 The production (raw-audio) export is implemented by tracing a wrapper module
-(`preprocessor → encoder → ctc_decoder`) with `torch.onnx.export`, so the
-audio front-end is bit-identical to NeMo's training-time preprocessing (no
-numpy reimplementation of STFT/mel/log/per-feature normalization needed).
-The graph uses dynamic axes on the time dimension (any audio length) and the
-script runs a post-export onnxruntime sanity check by default (`--no-validate`
-to skip). Existing outputs are never overwritten unless `--force` is passed.
+(`encoder → ctc_decoder`) with `torch.onnx.export`.  The NeMo preprocessor
+is excluded because `torch.stft()` produces complex types that the legacy
+TorchScript ONNX exporter cannot handle.  Mel features are computed in
+Python by `compute_mel_features()` before ONNX inference — this matches
+NeMo's own stock export approach (the preprocessor is never part of the
+ONNX graph).  The graph uses dynamic axes on the time dimension (any audio
+length) and the script runs a post-export onnxruntime sanity check by
+default (`--no-validate` to skip). Existing outputs are never overwritten
+unless `--force` is passed.
+
+The `FastConformerInference` class accepts raw waveforms as input
+(`log_probs(waveform)`) and performs mel preprocessing internally via
+`compute_mel_features()` — no change to the public API is needed.
 
 The stock export is optional for the Munajjam runtime — only
 `{stem}_ctc_rawaudio.onnx` + `tokenizer.model` are consumed.
@@ -151,8 +158,8 @@ export MUNAJJAM_FASTCONFORMER_VOCAB_PATH=/path/to/vocabulary.txt
 ## Verified ONNX contract (production graph)
 
 - Inputs
-  - `input_signal` — `tensor(float)` `[batch, time]`
-  - `input_signal_length` — `tensor(int32)` `[batch]`
+  - `input_signal` — `tensor(float)` `[batch, 80, T_mel]` (log-mel features)
+  - `input_signal_length` — `tensor(int32)` `[batch]` (valid frame count)
 - Outputs
   - `logprobs` — `tensor(float)` `[1, time//1280 + 1, 1025]`
   - `encoded_lengths` — `tensor(int64)` `[1]`
@@ -200,8 +207,9 @@ export is numerically faithful.
 
 The export script runs a post-export sanity check by default (disable with
 `--no-validate`): it loads `{stem}_ctc_rawaudio.onnx` with onnxruntime,
-verifies the I/O contract (float32 waveform + int32 length inputs, `logprobs`
-and `encoded_lengths` outputs) and executes a short dummy inference.
+verifies the I/O contract (float32 mel features + int32 frame count inputs,
+`logprobs` and `encoded_lengths` outputs) and executes a short dummy inference
+with a zero mel-spectrogram.
 
 The standalone `scripts/validate_fastconformer_onnx.py` used during the
 original validation session was a local throwaway; its checks (shape/dtype,
@@ -211,13 +219,15 @@ this built-in validation and into `FastConformerInference` itself.
 ## Result
 
 `FastConformerInference` works against the production graph with **no
-functional changes**; only documentation was updated. It is safe to use as
-the acoustic layer for `ctc_segmentation.py` (next phase: VAD chunking,
-quranic phonemization, `ctc-segmentation`, blank reward, dynamic trimming).
+functional changes** to the public API.  The mel preprocessing that was
+previously embedded in the ONNX graph (via NeMo's preprocessor) is now
+performed in Python by `compute_mel_features()` before ONNX inference.
+This resolves the STFT export failure (`torch.stft()` complex type
+incompatibility with the legacy TorchScript ONNX exporter) while maintaining
+numerical equivalence with NeMo's preprocessing pipeline.
 
 ## Known limitation
 
-NeMo's *stock* mel-input export is **not** supported by
-`FastConformerInference` (its input is log-mel features `[B, 80, T]`, which
-would require reimplementing the mel front-end outside the graph). Use the
-raw-audio production export.
+None.  Both the NeMo stock export and the Munajjam production export are
+now supported.  The production export performs mel preprocessing in Python
+(no NeMo dependency at runtime).

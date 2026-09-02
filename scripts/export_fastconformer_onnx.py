@@ -17,9 +17,12 @@ Two graphs are produced:
   ``change_decoding_strategy(decoder_type="ctc")``. Takes log-mel features
   (``audio_signal [B, 80, T_mel]`` + ``length [B]``); **not** consumed by
   ``FastConformerInference``.
-* ``{stem}_ctc_rawaudio.onnx`` — the Munajjam *production* graph: a single
-  self-contained graph (preprocessor -> encoder -> CTC head) that accepts raw
-  16 kHz mono waveforms directly. This is the file the runtime loads.
+* ``{stem}_ctc_rawaudio.onnx`` — the Munajjam *production* graph: encoder +
+  CTC decoder only.  The NeMo preprocessor is excluded because ``torch.stft()``
+  produces complex types that the legacy TorchScript ONNX exporter cannot
+  handle.  Mel features are computed in Python by ``compute_mel_features()``
+  before ONNX inference.  This is the file the runtime loads (mel preprocessing
+  happens internally).
 
 The SentencePiece tokenizer baked into the ``.nemo`` (and ``vocabulary.txt``
 when the archive carries it) is extracted alongside so the runtime has
@@ -34,7 +37,7 @@ Generated files (for the reference checkpoint, ``stem`` is
 ``stt_ar_fastconformer_hybrid_large_pc_v1.0``)::
 
     {output_dir}/{stem}_ctc.onnx                 stock mel-input graph (optional)
-    {output_dir}/{stem}_ctc_rawaudio.onnx        production raw-audio graph
+    {output_dir}/{stem}_ctc_rawaudio.onnx        production mel-input graph (encoder + CTC decoder)
     {output_dir}/{stem}_ctc_rawaudio.onnx.data   external weights (large models)
     {output_dir}/tokenizer.model                 SentencePiece model
     {output_dir}/vocabulary.txt                  labels dump (when present)
@@ -56,14 +59,15 @@ from typing import Any
 # --------------------------------------------------------------------------- #
 # ONNX contract constants (must match transcription/fastconformer.py)
 # --------------------------------------------------------------------------- #
-INPUT_SIGNAL_NAME = "input_signal"          # float32 [B, T] raw waveform @16 kHz
-INPUT_LENGTH_NAME = "input_signal_length"   # int32   [B] valid sample count
+INPUT_SIGNAL_NAME = "input_signal"          # float32 [B, n_mels, T_mel] mel features
+INPUT_LENGTH_NAME = "input_signal_length"   # int32   [B] valid frame count
 OUTPUT_LOGPROBS_NAME = "logprobs"           # float32 [B, T', V+1] (log-softmax)
 OUTPUT_LENGTH_NAME = "encoded_lengths"      # int64   [B] true frame count
 SAMPLE_RATE = 16000
+N_MELS = 80                                 # mel feature dimension (matches NeMo)
 DEFAULT_OPSET = 18
 
-# Documented I/O types of the production raw-audio graph (NodeArg.type),
+# Documented I/O types of the production mel-input graph (NodeArg.type),
 # validated by validate_onnx() before any inference is run.
 EXPECTED_IO_TYPES = {
     INPUT_SIGNAL_NAME: "tensor(float)",
@@ -399,28 +403,25 @@ def export_onnx_graphs(
         raise RuntimeError(f"NeMo stock export did not produce {stock_path}.")
     graphs["stock"] = stock_path
 
-    # 2) Production raw-audio export: preprocessor -> encoder -> CTC head in a
-    #    single traced graph.  The ConvASRDecoder.forward() takes a single
-    #    ``encoder_output`` and returns log-probabilities; the encoder length
-    #    passes through unchanged.  We use the legacy TorchScript ONNX exporter
-    #    (dynamo=False) because NeMo models contain LSTM/RNN layers and
-    #    @typecheck() decorators that are incompatible with the PyTorch 2.9+
-    #    dynamo-based exporter — matching NeMo's own Exportable._export()
-    #    default.
+    # 2) Production export: encoder -> CTC head in a single traced graph.
+    #    The NeMo preprocessor is excluded because torch.stft() produces
+    #    complex types that the legacy TorchScript ONNX exporter cannot handle.
+    #    Instead, the runtime (FastConformerInference) computes mel features
+    #    in Python via compute_mel_features() before calling ONNX inference.
+    #    This matches NeMo's own stock export approach.
     raw_onnx = output_dir / f"{stem}{RAW_AUDIO_ONNX_SUFFIX}"
     _write_bytes(raw_onnx, b"", force=force)  # honor --force / refuse overwrite
 
-    class RawAudioFastConformer(torch.nn.Module):
-        """Trace wrapper: NeMo preprocessor -> encoder -> CTC decoder.
+    class EncoderDecoderFastConformer(torch.nn.Module):
+        """Trace wrapper: encoder -> CTC decoder (mel-input ONNX graph).
 
-        Inputs match the production contract: a raw 16 kHz float32 waveform
-        and an int32 length; outputs are the CTC log-probabilities and the
-        encoded length.
+        Inputs are log-mel features [B, n_mels, T_mel] and frame counts
+        [B].  Mel preprocessing is performed in Python by the runtime
+        (FastConformerInference.compute_mel_features).
         """
 
         def __init__(self, traced: Any) -> None:
             super().__init__()
-            self.preprocessor = traced.preprocessor
             self.encoder = traced.encoder
 
             decoder = getattr(traced, "ctc_decoder", None)
@@ -439,20 +440,20 @@ def export_onnx_graphs(
             input_signal: Any,
             input_signal_length: Any,
         ) -> tuple[Any, Any]:
-            processed, processed_length = self.preprocessor(
-                input_signal=input_signal, length=input_signal_length
-            )
+            # input_signal: [B, n_mels, T_mel] (mel features)
+            # input_signal_length: [B] (valid frame count)
             encoded, encoded_length = self.encoder(
-                audio_signal=processed, length=processed_length
+                audio_signal=input_signal, length=input_signal_length
             )
             # ConvASRDecoder.forward() accepts only ``encoder_output`` and
             # returns a single log-probability tensor (no length output).
             logprobs = self.ctc_decoder(encoder_output=encoded)
             return logprobs, encoded_length
 
-    wrapper = RawAudioFastConformer(model)
-    dummy_signal = torch.randn(1, SAMPLE_RATE, dtype=torch.float32)
-    dummy_length = torch.tensor([SAMPLE_RATE], dtype=torch.int32)
+    wrapper = EncoderDecoderFastConformer(model)
+    # Dummy input: [B=1, n_mels=80, T_mel=100] (mel features, not raw audio)
+    dummy_signal = torch.randn(1, N_MELS, 100, dtype=torch.float32)
+    dummy_length = torch.tensor([100], dtype=torch.int32)
     # dynamo=False forces the legacy TorchScript exporter, required for NeMo
     # models with LSTM/RNN layers and @typecheck() decorators.  The dynamo
     # parameter was introduced in PyTorch 2.4; omit it on older versions where
@@ -464,7 +465,7 @@ def export_onnx_graphs(
         "input_names": [INPUT_SIGNAL_NAME, INPUT_LENGTH_NAME],
         "output_names": [OUTPUT_LOGPROBS_NAME, OUTPUT_LENGTH_NAME],
         "dynamic_axes": {
-            INPUT_SIGNAL_NAME: {0: "batch", 1: "time"},
+            INPUT_SIGNAL_NAME: {0: "batch", 2: "time"},
             INPUT_LENGTH_NAME: {0: "batch"},
             OUTPUT_LOGPROBS_NAME: {0: "batch", 1: "time"},
             OUTPUT_LENGTH_NAME: {0: "batch"},
@@ -483,7 +484,7 @@ def export_onnx_graphs(
         )
     except Exception as e:
         raise RuntimeError(
-            f"Raw-audio ONNX export failed for {raw_onnx}: {e}"
+            f"Encoder-decoder ONNX export failed for {raw_onnx}: {e}"
         ) from e
     graphs["raw_audio"] = raw_onnx
 
@@ -494,10 +495,10 @@ def export_onnx_graphs(
 # Post-export validation (onnxruntime)
 # --------------------------------------------------------------------------- #
 def validate_onnx(raw_onnx: Path) -> None:
-    """Run a tiny sanity inference on the exported raw-audio graph.
+    """Run a tiny sanity inference on the exported mel-input graph.
 
     Checks the I/O contract before running: input/output tensor names and
-    ``NodeArg.type`` metadata (float32 waveform + int32 length inputs,
+    ``NodeArg.type`` metadata (float32 mel features + int32 length inputs,
     float32 ``logprobs`` + int64 ``encoded_lengths`` outputs), then runs a
     short inference and validates the output shapes, including the trailing
     blank class (V+1 = 1025 for the reference model).
@@ -547,8 +548,9 @@ def validate_onnx(raw_onnx: Path) -> None:
                     f"got {actual!r}, expected {expected!r}."
                 )
 
-        signal = np.zeros((1, 1600), dtype=np.float32)  # 0.1 s @ 16 kHz
-        length = np.array([1600], dtype=np.int32)
+        # Dummy mel input: [B=1, n_mels=80, T_mel=100]
+        signal = np.zeros((1, N_MELS, 100), dtype=np.float32)
+        length = np.array([100], dtype=np.int32)
         outputs = session.run(None, {INPUT_SIGNAL_NAME: signal, INPUT_LENGTH_NAME: length})
         result = {o.name: a for o, a in zip(session.get_outputs(), outputs, strict=True)}
 

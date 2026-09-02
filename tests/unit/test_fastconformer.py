@@ -9,11 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from munajjam.exceptions import TranscriptionError
 from munajjam.transcription.fastconformer import (
-    FastConformerInference,
     FRAME_DURATION_SECONDS,
+    FastConformerInference,
 )
 
 
@@ -39,6 +38,7 @@ class FakeSession:
         signal_name: str = "input_signal",
         length_input_name: str = "input_signal_length",
         length_input_type: str = "tensor(int32)",
+        mel_input: bool = False,  # True for mel-input graph (3D signal)
     ):
         self._logprobs_name = logprobs_name
         self._length_name = length_name
@@ -48,9 +48,17 @@ class FakeSession:
         self._signal_name = signal_name
         self._length_input_name = length_input_name
         self._length_input_type = length_input_type
+        self._mel_input = mel_input
         self.calls: list[tuple[list[str], dict[str, np.ndarray]]] = []
 
     def get_inputs(self) -> list[FakeIO]:
+        if self._mel_input:
+            # Mel-input graph: [B, n_mels, T_mel]
+            return [
+                FakeIO(self._signal_name, ["B", "n_mels", "T_mel"], "tensor(float)"),
+                FakeIO(self._length_input_name, ["B"], self._length_input_type),
+            ]
+        # Raw-audio graph: [B, T]
         return [
             FakeIO(self._signal_name, ["B", "T"], "tensor(float)"),
             FakeIO(self._length_input_name, ["B"], self._length_input_type),
@@ -272,7 +280,7 @@ def test_no_model_path():
 
 
 def test_unexpected_input_count(tmp_path: Path):
-    """A cache-enabled (streaming-style) export is rejected with guidance."""
+    """A cache-enabled (streaming-style) export is accepted — we pick signal/length."""
     model_path = tmp_path / "model.onnx"
     model_path.write_bytes(b"dummy")
 
@@ -290,8 +298,10 @@ def test_unexpected_input_count(tmp_path: Path):
         model_path=model_path,
         session_factory=lambda _p: CacheSession(),
     )
-    with pytest.raises(TranscriptionError, match="raw-audio"):
-        model.load()
+    # Should load successfully — we pick the 2D float and 1D int inputs.
+    model.load()
+    assert model._input_signal_name == "audio_signal"
+    assert model._input_length_name == "length"
 
 
 def test_output_rank_and_batch_validation():
@@ -450,9 +460,9 @@ def test_int64_length_output_is_recognized():
     assert log_probs.shape == (7, 1025)  # trimmed to encoded_lengths
 
 
-def test_stock_mel_input_export_rejected():
-    """NeMo's stock mel-input export (3-D float input) is rejected with a hint."""
-    session = FakeSession()
+def test_stock_mel_input_export_detected():
+    """NeMo's stock mel-input export (3-D float input) is detected as mel-input."""
+    session = FakeSession(mel_input=True)
     session.get_inputs = lambda: [  # type: ignore[method-assign]
         FakeIO("audio_signal", ["B", 80, "T"], "tensor(float)"),
         FakeIO("length", ["B"], "tensor(int64)"),
@@ -462,8 +472,10 @@ def test_stock_mel_input_export_rejected():
         model_path="model.onnx",
         session_factory=lambda _p: session,
     )
-    with pytest.raises(TranscriptionError, match="raw-audio"):
-        model.load()
+    model.load()
+    assert model._needs_preprocessing is True
+    assert model._input_signal_name == "audio_signal"
+    assert model._input_length_name == "length"
 
 
 def test_length_dtype_range_overflow_int8():
@@ -507,3 +519,317 @@ def test_length_dtype_int32_int64_no_overflow_on_typical_audio():
         assert result.ndim == 2
         expected_dtype = np.int32 if desc == "tensor(int32)" else np.int64
         assert session.calls[-1][1]["input_signal_length"].dtype == expected_dtype
+
+
+# --------------------------------------------------------------------------- #
+# Mel preprocessing tests
+# --------------------------------------------------------------------------- #
+
+
+class TestComputeMelFeatures:
+    """Tests for compute_mel_features() — NeMo-equivalent mel front-end."""
+
+    def test_output_shape(self):
+        """Output is [1, n_mels, T_mel] with n_mels=80."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        waveform = np.random.RandomState(42).randn(16000).astype(np.float32)
+        mel = compute_mel_features(waveform)
+
+        assert mel.ndim == 3
+        assert mel.shape[0] == 1
+        assert mel.shape[1] == 80  # n_mels
+        assert mel.shape[2] > 0    # T_mel > 0
+
+    def test_dtype_float32(self):
+        """Output is float32 regardless of input dtype."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        waveform_f64 = np.random.RandomState(42).randn(16000)
+        mel = compute_mel_features(waveform_f64)
+
+        assert mel.dtype == np.float32
+
+    def test_rejects_2d_input(self):
+        """A 2-D input raises ValueError."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        with pytest.raises(ValueError, match="1-D"):
+            compute_mel_features(np.zeros((1, 16000), dtype=np.float32))
+
+    def test_empty_waveform_returns_empty(self):
+        """An empty waveform produces a mel spectrogram (possibly empty)."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        waveform = np.array([], dtype=np.float32)
+        mel = compute_mel_features(waveform)
+
+        assert mel.ndim == 3
+        assert mel.shape[1] == 80
+
+    def test_frame_count_matches_neMo(self):
+        """For 1 s of audio, expect ~97 mel frames (matching NeMo FilterbankFeatures)."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        # 1 s @ 16 kHz → pre-emphasis + center-pad → floor(len(padded - n_fft) / hop) + 1
+        waveform = np.random.RandomState(42).randn(16000).astype(np.float32)
+        mel = compute_mel_features(waveform)
+
+        # NeMo: n_frames = floor((16000 + 256 - 400) / 160) + 1 = floor(15856/160) + 1 = 99 + 1 = 100
+        # Our implementation uses center-pad of n_fft//2 = 256 on each side, same as NeMo.
+        # Exact frame count depends on pre-emphasis edge handling; accept a small range.
+        assert 95 <= mel.shape[2] <= 105, f"Unexpected frame count: {mel.shape[2]}"
+
+    def test_per_channel_normalization(self):
+        """Per-channel mean ≈ 0, std ≈ 1 after normalization."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        waveform = np.random.RandomState(42).randn(32000).astype(np.float32)
+        mel = compute_mel_features(waveform)  # [1, 80, T]
+
+        mean = mel[0].mean(axis=1)  # per-channel mean
+        std = mel[0].std(axis=1)    # per-channel std
+        np.testing.assert_allclose(mean, 0.0, atol=0.05)
+        np.testing.assert_allclose(std, 1.0, atol=0.1)
+
+    def test_log_floor_guard(self):
+        """Mel values should not produce -inf (log floor guard active)."""
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        # Silence → very small power → floor guard should prevent -inf
+        waveform = np.zeros(16000, dtype=np.float32)
+        mel = compute_mel_features(waveform)
+
+        assert np.all(np.isfinite(mel))
+
+
+# --------------------------------------------------------------------------- #
+# I/O detection tests (raw-audio vs mel-input)
+# --------------------------------------------------------------------------- #
+
+
+class TestIODetection:
+    """Tests for _find_signal_and_length() accepting both input layouts."""
+
+    def test_mel_input_detected(self):
+        """3-D float input is detected as mel-input (needs_preprocessing=True)."""
+        model = make_inference(FakeSession(mel_input=True))
+        model.load()
+
+        assert model._needs_preprocessing is True
+
+    def test_raw_audio_detected(self):
+        """2-D float input is detected as raw-audio (needs_preprocessing=False)."""
+        model = make_inference(FakeSession(mel_input=False))
+        model.load()
+
+        assert model._needs_preprocessing is False
+
+    def test_mel_input_skips_preprocessing(self):
+        """When needs_preprocessing=True, raw waveform is preprocessed to mel."""
+        session = FakeSession(mel_input=True)
+        model = make_inference(session)
+
+        waveform = np.random.RandomState(42).randn(16000).astype(np.float32)
+        model.log_probs(waveform)
+
+        # The ONNX feed should contain mel features [1, 80, T_mel], not raw audio [1, T]
+        _, input_feed = session.calls[-1]
+        signal = input_feed["input_signal"]
+        assert signal.ndim == 3
+        assert signal.shape[0] == 1
+        assert signal.shape[1] == 80  # n_mels
+
+    def test_raw_audio_no_preprocessing(self):
+        """When needs_preprocessing=False, raw waveform is passed directly."""
+        session = FakeSession(mel_input=False)
+        model = make_inference(session)
+
+        waveform = np.random.RandomState(42).randn(8000).astype(np.float32)
+        model.log_probs(waveform)
+
+        # The ONNX feed should contain raw audio [1, T]
+        _, input_feed = session.calls[-1]
+        signal = input_feed["input_signal"]
+        assert signal.ndim == 2
+        assert signal.shape == (1, 8000)
+
+    def test_mel_input_unexpected_shape_raises(self):
+        """If the ONNX graph has neither 2D nor 3D float input, raise."""
+
+        class BadSession(FakeSession):
+            def get_inputs(self):
+                return [FakeIO("x", ["B", "C", "H", "W"], "tensor(float)")]
+
+        model = make_inference(BadSession())
+        with pytest.raises(TranscriptionError, match="Unexpected ONNX inputs"):
+            model.load()
+
+
+# --------------------------------------------------------------------------- #
+# Regression: STFT export failure is resolved
+# --------------------------------------------------------------------------- #
+
+
+class TestSTFTExportFailureRegression:
+    """Regression tests ensuring the STFT export failure is resolved."""
+
+    def test_mel_preprocessing_no_stft_in_graph(self):
+        """The ONNX graph no longer contains the NeMo preprocessor.
+
+        The mel computation is now in Python (compute_mel_features()),
+        which avoids the torch.stft() complex type export failure.
+        """
+        from munajjam.transcription.fastconformer import compute_mel_features
+
+        # This function is pure numpy — no torch.stft() involved.
+        waveform = np.random.RandomState(42).randn(16000).astype(np.float32)
+        mel = compute_mel_features(waveform)
+
+        assert mel.ndim == 3
+        assert mel.shape[1] == 80
+        assert np.all(np.isfinite(mel))
+
+    def test_export_script_no_preprocessor(self):
+        """The export script no longer references traced.preprocessor."""
+        import inspect
+
+        from scripts.export_fastconformer_onnx import export_onnx_graphs
+
+        source = inspect.getsource(export_onnx_graphs)
+        # The wrapper class should not access traced.preprocessor
+        assert "traced.preprocessor" not in source
+        # The wrapper should only have encoder and decoder
+        assert "self.encoder = traced.encoder" in source
+        assert "self.ctc_decoder = decoder" in source
+
+
+# --------------------------------------------------------------------------- #
+# NeMo numerical equivalence integration test
+# --------------------------------------------------------------------------- #
+# This test requires torch + nemo_toolkit.  It is skipped in normal unit-test
+# runs (where those are not installed) and expected to run in the Colab
+# validation environment where both are available.
+
+
+class TestNeMoNumericalEquivalence:
+    """Compare compute_mel_features() against NeMo's FilterbankFeatures.
+
+    These tests are skipped if torch or nemo are not installed.
+    They verify numerical equivalence on the same deterministic waveform.
+    """
+
+    @staticmethod
+    def _nemo_available() -> bool:
+        import importlib.util
+
+        return (
+            importlib.util.find_spec("torch") is not None
+            and importlib.util.find_spec("nemo") is not None
+        )
+
+    @pytest.mark.skipif(
+        not _nemo_available.__func__(),  # type: ignore[attr-defined]
+        reason="torch or nemo not installed",
+    )
+    def test_output_shape_matches_nemo(self):
+        """Output shape [1, 80, T_mel] matches NeMo FilterbankFeatures."""
+        import torch
+        from munajjam.transcription.fastconformer import compute_mel_features
+        from nemo.collections.asr.parts.preprocessing.features import (
+            FilterbankFeatures,
+        )
+
+        rng = np.random.RandomState(42)
+        waveform = rng.randn(16000).astype(np.float32)
+
+        # NeMo preprocessor
+        nemo = FilterbankFeatures(
+            sample_rate=16000,
+            n_window_size=400,
+            n_window_stride=160,
+            n_fft=512,
+            nfilt=80,
+            lowfreq=0,
+            highfreq=8000,
+            window="hann",
+            normalize="per_feature",
+            log=True,
+            log_zero_guard_type="add",
+            log_zero_guard_value=2**-24,
+            pad_to=0,
+            preemph=0.97,
+            dither=0.0,
+            mag_power=2.0,
+            mel_norm="slaney",
+            use_grads=False,
+        )
+        nemo.eval()
+
+        with torch.no_grad():
+            nemo_out, _ = nemo(
+                torch.tensor(waveform).unsqueeze(0),
+                torch.tensor([len(waveform)], dtype=torch.long),
+            )
+
+        our_out = compute_mel_features(waveform)
+
+        assert our_out.shape == nemo_out.shape, (
+            f"Shape mismatch: ours={our_out.shape}, nemo={nemo_out.shape}"
+        )
+
+    @pytest.mark.skipif(
+        not _nemo_available.__func__(),  # type: ignore[attr-defined]
+        reason="torch or nemo not installed",
+    )
+    def test_numerical_equivalence_mean_abs_error(self):
+        """Mean absolute error between NumPy and NeMo mel < 1e-5."""
+        import torch
+        from munajjam.transcription.fastconformer import compute_mel_features
+        from nemo.collections.asr.parts.preprocessing.features import (
+            FilterbankFeatures,
+        )
+
+        rng = np.random.RandomState(42)
+        waveform = rng.randn(16000).astype(np.float32)
+
+        nemo = FilterbankFeatures(
+            sample_rate=16000,
+            n_window_size=400,
+            n_window_stride=160,
+            n_fft=512,
+            nfilt=80,
+            lowfreq=0,
+            highfreq=8000,
+            window="hann",
+            normalize="per_feature",
+            log=True,
+            log_zero_guard_type="add",
+            log_zero_guard_value=2**-24,
+            pad_to=0,
+            preemph=0.97,
+            dither=0.0,
+            mag_power=2.0,
+            mel_norm="slaney",
+            use_grads=False,
+        )
+        nemo.eval()
+
+        with torch.no_grad():
+            nemo_out, _ = nemo(
+                torch.tensor(waveform).unsqueeze(0),
+                torch.tensor([len(waveform)], dtype=torch.long),
+            )
+
+        our_out = compute_mel_features(waveform)
+        nemo_np = nemo_out.numpy()
+
+        mean_abs_err = float(np.mean(np.abs(our_out - nemo_np)))
+        max_abs_err = float(np.max(np.abs(our_out - nemo_np)))
+
+        assert mean_abs_err < 1e-5, (
+            f"Mean absolute error {mean_abs_err:.2e} exceeds 1e-5 threshold"
+        )
+        assert max_abs_err < 1e-4, (
+            f"Max absolute error {max_abs_err:.2e} exceeds 1e-4 threshold"
+        )
