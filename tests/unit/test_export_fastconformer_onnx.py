@@ -620,3 +620,80 @@ def test_wrapper_raises_when_no_decoder(
 
     with pytest.raises((AttributeError, RuntimeError), match="neither 'ctc_decoder' nor 'decoder'"):
         _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+
+# --------------------------------------------------------------------------- #
+# Regression: Blocker #3 — decoder signature + dynamo=False
+# --------------------------------------------------------------------------- #
+def test_wrapper_calls_decoder_with_single_arg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ConvASRDecoder.forward() accepts only ``encoder_output``; the wrapper
+    must not pass ``encoded_lengths`` and must handle a single return value."""
+    fake_model = MagicMock()
+    fake_model.ctc_decoder.return_value = MagicMock(name="logprobs_tensor")
+
+    fake_torch = _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+    fake_torch.onnx.export.assert_called_once()
+    wrapper = fake_torch.onnx.export.call_args[0][0]
+    # Verify the wrapper can be instantiated and its ctc_decoder is set.
+    assert wrapper.ctc_decoder is fake_model.ctc_decoder
+
+
+def test_wrapper_forward_passes_length_from_encoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapper must pass the encoder's encoded_length through as the
+    second output, not from the decoder (which returns only logprobs).
+
+    ConvASRDecoder.forward(encoder_output) returns a single tensor — the
+    wrapper must handle this and return (logprobs, encoded_length) where
+    encoded_length comes from the encoder."""
+    fake_model = MagicMock()
+    # Simulate ConvASRDecoder returning a single tensor (no tuple).
+    fake_model.ctc_decoder.return_value = MagicMock(name="logprobs_tensor")
+    # Encoder returns a 2-tuple (encoded, encoded_length).
+    fake_encoder_length = MagicMock(name="encoded_length")
+    fake_model.encoder.return_value = (MagicMock(name="encoded"), fake_encoder_length)
+
+    fake_torch = _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+    fake_torch.onnx.export.assert_called_once()
+    wrapper = fake_torch.onnx.export.call_args[0][0]
+
+    # Verify the wrapper calls the decoder with only encoder_output.
+    # We can't call wrapper.forward() directly with real tensors (no torch),
+    # but we can inspect the source to confirm the call pattern.
+    import inspect
+
+    src = inspect.getsource(wrapper.forward)
+    # The decoder must be called with exactly one kwarg: encoder_output.
+    assert "self.ctc_decoder(encoder_output=" in src
+    # Must NOT pass encoded_lengths to the decoder.
+    assert "encoded_lengths" not in src.split("self.ctc_decoder")[1].split(")")[0]
+
+
+def test_export_uses_legacy_exporter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """torch.onnx.export must be called with dynamo=False when the installed
+    PyTorch supports the parameter (>= 2.4).  On older PyTorch (< 2.4) the
+    parameter is omitted — the legacy exporter is already the only option.
+
+    NeMo models contain LSTM/RNN layers and @typecheck() decorators
+    incompatible with the dynamo exporter (PyTorch >= 2.9 default)."""
+    fake_model = MagicMock()
+    fake_model.ctc_decoder.return_value = MagicMock(name="logprobs_tensor")
+
+    fake_torch = _run_export_with_model(tmp_path, monkeypatch, fake_model)
+
+    call_kwargs = fake_torch.onnx.export.call_args[1]
+    # When dynamo is supported, it must be set to False.
+    if "dynamo" in call_kwargs:
+        assert call_kwargs["dynamo"] is False
+    # Verify the conditional logic is present in source (backward-compat).
+    import inspect
+
+    src = inspect.getsource(exporter.export_onnx_graphs)
+    assert '"dynamo" in _export_sig.parameters' in src

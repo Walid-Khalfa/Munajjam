@@ -400,8 +400,13 @@ def export_onnx_graphs(
     graphs["stock"] = stock_path
 
     # 2) Production raw-audio export: preprocessor -> encoder -> CTC head in a
-    #    single traced graph. Signatures follow NeMo 2.0.0rc1, verified against
-    #    the reference checkpoint in docs/fastconformer-onnx-validation.md.
+    #    single traced graph.  The ConvASRDecoder.forward() takes a single
+    #    ``encoder_output`` and returns log-probabilities; the encoder length
+    #    passes through unchanged.  We use the legacy TorchScript ONNX exporter
+    #    (dynamo=False) because NeMo models contain LSTM/RNN layers and
+    #    @typecheck() decorators that are incompatible with the PyTorch 2.9+
+    #    dynamo-based exporter — matching NeMo's own Exportable._export()
+    #    default.
     raw_onnx = output_dir / f"{stem}{RAW_AUDIO_ONNX_SUFFIX}"
     _write_bytes(raw_onnx, b"", force=force)  # honor --force / refuse overwrite
 
@@ -440,29 +445,41 @@ def export_onnx_graphs(
             encoded, encoded_length = self.encoder(
                 audio_signal=processed, length=processed_length
             )
-            logprobs, encoded_lengths = self.ctc_decoder(
-                encoder_output=encoded, encoded_lengths=encoded_length
-            )
-            return logprobs, encoded_lengths
+            # ConvASRDecoder.forward() accepts only ``encoder_output`` and
+            # returns a single log-probability tensor (no length output).
+            logprobs = self.ctc_decoder(encoder_output=encoded)
+            return logprobs, encoded_length
 
     wrapper = RawAudioFastConformer(model)
     dummy_signal = torch.randn(1, SAMPLE_RATE, dtype=torch.float32)
     dummy_length = torch.tensor([SAMPLE_RATE], dtype=torch.int32)
+    # dynamo=False forces the legacy TorchScript exporter, required for NeMo
+    # models with LSTM/RNN layers and @typecheck() decorators.  The dynamo
+    # parameter was introduced in PyTorch 2.4; omit it on older versions where
+    # the legacy exporter is already the only option.
+    import inspect as _inspect
+
+    _export_sig = _inspect.signature(torch.onnx.export)
+    _export_kwargs: dict[str, Any] = {
+        "input_names": [INPUT_SIGNAL_NAME, INPUT_LENGTH_NAME],
+        "output_names": [OUTPUT_LOGPROBS_NAME, OUTPUT_LENGTH_NAME],
+        "dynamic_axes": {
+            INPUT_SIGNAL_NAME: {0: "batch", 1: "time"},
+            INPUT_LENGTH_NAME: {0: "batch"},
+            OUTPUT_LOGPROBS_NAME: {0: "batch", 1: "time"},
+            OUTPUT_LENGTH_NAME: {0: "batch"},
+        },
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    if "dynamo" in _export_sig.parameters:
+        _export_kwargs["dynamo"] = False
     try:
         torch.onnx.export(
             wrapper,
             (dummy_signal, dummy_length),
             str(raw_onnx),
-            input_names=[INPUT_SIGNAL_NAME, INPUT_LENGTH_NAME],
-            output_names=[OUTPUT_LOGPROBS_NAME, OUTPUT_LENGTH_NAME],
-            dynamic_axes={
-                INPUT_SIGNAL_NAME: {0: "batch", 1: "time"},
-                INPUT_LENGTH_NAME: {0: "batch"},
-                OUTPUT_LOGPROBS_NAME: {0: "batch", 1: "time"},
-                OUTPUT_LENGTH_NAME: {0: "batch"},
-            },
-            opset_version=opset,
-            do_constant_folding=True,
+            **_export_kwargs,
         )
     except Exception as e:
         raise RuntimeError(
