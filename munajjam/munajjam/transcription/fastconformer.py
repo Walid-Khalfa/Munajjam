@@ -170,7 +170,7 @@ def compute_mel_features(waveform: np.ndarray, sample_rate: int = DEFAULT_SAMPLE
 
     # 3. Pad for center STFT (pad n_fft//2 on each side, matching torch.stft center=True)
     pad_width = N_FFT // 2
-    padded = np.pad(emphasized, pad_width, mode="constant")
+    padded = np.pad(emphasized, pad_width, mode="reflect")
 
     # 4. STFT frame extraction — torch.stft(center=True) extracts n_fft-sized
     #    frames at positions 0, hop, 2*hop, ... from the center-padded signal.
